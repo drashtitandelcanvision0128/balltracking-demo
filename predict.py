@@ -4,6 +4,7 @@ import math
 import time
 import cv2
 import os
+import numpy as np
 
 def angle_between_lines(m1, m2=1):
     if m1 != -1/m2:
@@ -11,6 +12,20 @@ def angle_between_lines(m1, m2=1):
         return angle
     else:
         return 90.0
+
+def draw_dashed_line(img, pt1, pt2, color, thickness=1, gap=15):
+    dist = math.hypot(pt2[0] - pt1[0], pt2[1] - pt1[1])
+    if dist == 0:
+        return
+    dashes = max(1, int(dist / gap))
+    for i in range(dashes):
+        start_t = i / dashes
+        end_t = (i + 0.5) / dashes
+        start_x = int(pt1[0] + start_t * (pt2[0] - pt1[0]))
+        start_y = int(pt1[1] + start_t * (pt2[1] - pt1[1]))
+        end_x = int(pt1[0] + end_t * (pt2[0] - pt1[0]))
+        end_y = int(pt1[1] + end_t * (pt2[1] - pt1[1]))
+        cv2.line(img, (start_x, start_y), (end_x, end_y), color, thickness, cv2.LINE_AA)
 
 class FixedSizeQueue:
     def __init__(self, max_size):
@@ -37,6 +52,12 @@ model = YOLO(model_path)
 
 video_path = os.path.join('videos','test1.mp4')
 cap = cv2.VideoCapture(video_path)
+
+# Initialize VideoWriter to save the output
+fps_out = int(cap.get(cv2.CAP_PROP_FPS))
+if fps_out == 0: fps_out = 30
+out = cv2.VideoWriter('output_test.mp4', cv2.VideoWriter_fourcc(*'mp4v'), fps_out, (1000, 600))
+
 ret = True
 prevTime = 0
 centroid_history = FixedSizeQueue(10)
@@ -80,12 +101,23 @@ while ret:
                 
         if len(centroid_history) > 1:
             centroid_list = list(centroid_history.get_queue())
-            for i in range(1, len(centroid_history)):
-                # if math.sqrt(y_diff**2+x_diff**2)<7:
-                cv2.line(frame, centroid_history.get_queue()[i-1], centroid_history.get_queue()[i], (255, 0, 0), 4)    
+            n_points = len(centroid_list)
+            
+            # 1. Fading Tail & Glow/Shadow Effect for Past Trajectory
+            for i in range(1, n_points):
+                # Calculate thickness based on age (older is thinner)
+                thickness = int(2 + (i / n_points) * 4) # Range ~2 to 6
                 
-        if len(centroid_history) > 1:
-            centroid_list = list(centroid_history.get_queue())
+                # Calculate color intensity (older is lighter blue, newer is deep blue)
+                blue_intensity = int(100 + (i / n_points) * 155)
+                color = (blue_intensity, 0, 0)
+                
+                # Shadow/Glow (Draw thick black line underneath)
+                cv2.line(frame, centroid_list[i-1], centroid_list[i], (0, 0, 0), thickness + 3, cv2.LINE_AA)
+                
+                # Main Line (Smooth with LINE_AA)
+                cv2.line(frame, centroid_list[i-1], centroid_list[i], color, thickness, cv2.LINE_AA)
+                
             x_diff = centroid_list[-1][0] - centroid_list[-2][0]
             y_diff = centroid_list[-1][1] - centroid_list[-2][1]
             if(x_diff!=0):
@@ -96,24 +128,36 @@ while ret:
                     angle = 90-angle_between_lines(m1)
                 if angle>=45:
                         print("ball bounced")
+                        
+            # Future Positions prediction
             future_positions = [centroid_list[-1]]
-            for i in range(1, 5):
+            # Predict further ahead with smaller steps for smoother look
+            for i in range(1, 8):
                 future_positions.append(
                     (
-                        centroid_list[-1][0] + x_diff * i,
-                        centroid_list[-1][1] + y_diff * i
+                        int(centroid_list[-1][0] + x_diff * (i * 0.7)),
+                        int(centroid_list[-1][1] + y_diff * (i * 0.7))
                     )
                 )
-            print("Future Positions: ",future_positions)
-            for i in range(1,len(future_positions)):
-                cv2.line(frame, future_positions[i-1], future_positions[i], (0, 255, 0), 4)
-                cv2.circle(frame,future_positions[i],radius=3,color=(0,0,255),thickness=-1)
+            print("Future Positions: ", future_positions)
+            
+            # 2. Dashed Line & Glow for Future Prediction
+            for i in range(1, len(future_positions)):
+                # Shadow/Glow for future line
+                draw_dashed_line(frame, future_positions[i-1], future_positions[i], (0, 0, 0), 4, gap=15)
+                # Green Dashed line
+                draw_dashed_line(frame, future_positions[i-1], future_positions[i], (0, 255, 0), 2, gap=15)
+                # Circle at end points (Optional, can be commented out if it looks too cluttered)
+                # cv2.circle(frame, future_positions[i], radius=3, color=(0,0,255), thickness=-1, lineType=cv2.LINE_AA)
                 
 
         text = "Angle: {:.2f} degrees".format(angle)
         cv2.putText(frame,text,(20,20),cv2.FONT_HERSHEY_PLAIN,1,(255,0,0),2)
         cv2.putText(frame, f'FPS: {fps}', (20, 50), cv2.FONT_HERSHEY_SIMPLEX , 1, (255, 0, 0), 2) 
         frame_resized = cv2.resize(frame, (1000, 600))
+        
+        # Save the frame to the output video
+        out.write(frame_resized)
 
         if display_enabled:
             try:
@@ -138,6 +182,7 @@ while ret:
                 elif key == ord('q'):
                     break
 cap.release()
+out.release()
 if display_enabled:
     cv2.destroyAllWindows()
 
