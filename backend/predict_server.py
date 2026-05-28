@@ -131,6 +131,7 @@ def process_video(input_path, output_path):
     speed_mph = 0.0
     spin_deg = 0.0
     swing_sf = 0.0
+    frames_since_last_detect = 0
 
     while True:
         ret, frame = cap.read()
@@ -149,17 +150,24 @@ def process_video(input_path, output_path):
             start_time = current_time
 
         if frame_index % FRAME_STRIDE == 0:
-            results = model.track(frame, persist=True, conf=0.10, verbose=False)
+            results = model.track(frame, persist=True, conf=0.25, verbose=False)
             boxes = results[0].boxes
             current_detections = []
 
             if len(boxes) > 0:
-                for box in boxes:
-                    x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
-                    centroid_x = int((x1 + x2) / 2)
-                    centroid_y = int((y1 + y2) / 2)
-                    current_detections.append((x1, y1, x2, y2, centroid_x, centroid_y))
-                    centroid_history.add((centroid_x, centroid_y))
+                frames_since_last_detect = 0
+                # ONLY take the most confident detection (the first one) to avoid zigzags between ball/pad/glove
+                box = boxes[0]
+                x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+                centroid_x = int((x1 + x2) / 2)
+                centroid_y = int((y1 + y2) / 2)
+                current_detections.append((x1, y1, x2, y2, centroid_x, centroid_y))
+                centroid_history.add((centroid_x, centroid_y))
+            else:
+                frames_since_last_detect += FRAME_STRIDE
+                
+            if frames_since_last_detect > 30:
+                centroid_history.clear()
         
         for x1, y1, x2, y2, centroid_x, centroid_y in current_detections:
             # We will show the bounding boxes for debugging
