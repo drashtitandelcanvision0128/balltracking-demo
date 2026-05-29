@@ -14,7 +14,7 @@ const CricketTrajectoryPredictor: React.FC = () => {
   const [deletedBounces, setDeletedBounces] = useState<number>(78);
   const [videoDuration, setVideoDuration] = useState<number>(0);
   const [currentTime, setCurrentTime] = useState<number>(0);
-  
+  const [isDragging, setIsDragging] = useState<boolean>(false);
   const videoRef = useRef<HTMLVideoElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -27,12 +27,11 @@ const CricketTrajectoryPredictor: React.FC = () => {
     };
   }, [videoUrl]);
 
-  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0] || null;
+  const processSelectedFile = (file: File | null) => {
     if (file) {
       setSelectedFile(file);
       setFileName(file.name);
-      setStatusText(`Selected: ${file.name}. Click 'Upload and Predict'.`);
+      setStatusText(`Selected: ${file.name}. Click 'Start Prediction'.`);
       setIsProcessed(false);
       // Reset stats to default
       setFramesProcessed(843);
@@ -41,17 +40,41 @@ const CricketTrajectoryPredictor: React.FC = () => {
       // Clear previous video URL
       if (videoUrl && videoUrl.startsWith('blob:')) {
         URL.revokeObjectURL(videoUrl);
-        setVideoUrl('');
       }
-      if (videoRef.current) {
-        videoRef.current.src = '';
-      }
+      // Preview the selected video before prediction
+      setVideoUrl(URL.createObjectURL(file));
     } else {
       setSelectedFile(null);
       setFileName('video.mp4');
       setStatusText('No file selected.');
     }
   };
+
+  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0] || null;
+    processSelectedFile(file);
+  };
+
+  const handleDragOver = useCallback((e: React.DragEvent) => {
+    e.preventDefault();
+    setIsDragging(true);
+  }, []);
+
+  const handleDragLeave = useCallback((e: React.DragEvent) => {
+    e.preventDefault();
+    setIsDragging(false);
+  }, []);
+
+  const handleDrop = useCallback((e: React.DragEvent) => {
+    e.preventDefault();
+    setIsDragging(false);
+    const file = e.dataTransfer.files?.[0];
+    if (file && file.type.startsWith('video/')) {
+      processSelectedFile(file);
+    } else {
+      setStatusText('Please drop a valid video file.');
+    }
+  }, [videoUrl]);
 
   const handleTimeUpdate = () => {
     if (videoRef.current) {
@@ -172,41 +195,32 @@ const CricketTrajectoryPredictor: React.FC = () => {
           {/* Header */}
           <div style={styles.header}>
             <div style={styles.titleSection}>
-              <h1 style={styles.title}>CRICKET BALL TRAJECTORY PREDICTOR</h1>
-              <p style={styles.subtitle}>Upload a cricket video & AI-powered trajectory overlay | Neon mint analytics</p>
+              <h1 style={styles.title}><span style={styles.liveIndicator}>AI </span>BOWLER</h1>
+              <p style={styles.subtitle}>Upload a cricket video & AI-powered trajectory overlay</p>
             </div>
-            <div style={styles.badge}>
-              <span style={styles.badgeText}>PREDICTION ENGINE <span style={styles.liveIndicator}>● ACTIVE</span></span>
+            <div style={styles.headerActions}>
+              <a href="https://aibowler.in/" style={styles.homeButton}>
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{marginRight: '6px'}}>
+                  <path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"></path>
+                  <polyline points="9 22 9 12 15 12 15 22"></polyline>
+                </svg>
+                Home
+              </a>
+              <div style={styles.badge}>
+                <span style={styles.badgeText}>PREDICTION ENGINE <span style={styles.liveIndicator}>● ACTIVE</span></span>
+              </div>
             </div>
           </div>
 
-          {/* Upload Section */}
-          <div style={styles.uploadSection}>
-            <div style={styles.uploadGrid}>
-              <label style={styles.fileLabel} htmlFor="videoUpload">
-                Choose File
-              </label>
-              <input
-                ref={fileInputRef}
-                id="videoUpload"
-                type="file"
-                accept="video/mp4,video/mov,video/avi"
-                onChange={handleFileChange}
-                style={styles.hiddenInput}
-              />
-              <div style={styles.fileName}>{fileName}</div>
-              <button
-                style={{ ...styles.primaryBtn, ...(isProcessing ? styles.disabledBtn : {}) }}
-                onClick={startPrediction}
-                disabled={isProcessing}
-              >
-                {isProcessing ? 'Processing...' : 'Upload and Predict'}
-              </button>
-            </div>
-            <div style={styles.statusBar}>
-              <span style={styles.statusText}>{statusText}</span>
-            </div>
-          </div>
+          {/* Hidden File Input for Dropzone */}
+          <input
+            ref={fileInputRef}
+            id="videoUpload"
+            type="file"
+            accept="video/mp4,video/mov,video/avi"
+            onChange={handleFileChange}
+            style={styles.hiddenInput}
+          />
 
           {/* Main Prediction Area */}
           <div style={styles.predictionArea}>
@@ -214,28 +228,76 @@ const CricketTrajectoryPredictor: React.FC = () => {
             <div style={styles.videoCard}>
               <div style={styles.videoTitle}>
                 <span>PREDICTED VIDEO</span>
-                <span style={styles.liveTag}>LIVE TRAJECTORY</span>
+                <span style={styles.liveTag}>BALL TRAJECTORY</span>
               </div>
-              <div style={styles.videoWrapper}>
-                <video
-                  ref={videoRef}
-                  src={videoUrl || undefined}
-                  controls
-                  style={styles.video}
-                  onTimeUpdate={handleTimeUpdate}
-                  onLoadedMetadata={handleLoadedMetadata}
-                  poster="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='640' height='360' viewBox='0 0 640 360'%3E%3Crect width='640' height='360' fill='%23030A0A'/%3E%3Ctext x='50%25' y='50%25' font-size='16' fill='%2338F0B0' text-anchor='middle' dy='.3em' font-family='monospace'%3ETrajectory Preview%3C/text%3E%3C/svg%3E"
-                >
-                  Your browser does not support the video tag.
-                </video>
+              <div 
+                style={{
+                  ...styles.videoWrapper,
+                  ...(isDragging ? styles.videoWrapperDragging : {})
+                }}
+                onDragOver={handleDragOver}
+                onDragLeave={handleDragLeave}
+                onDrop={handleDrop}
+              >
+                {isProcessing && (
+                  <div style={styles.processingOverlay}>
+                    <svg width="64" height="64" viewBox="0 0 50 50" stroke="#38F0B0" strokeWidth="3" fill="none">
+                      <circle cx="25" cy="25" r="20" strokeOpacity="0.2" />
+                      <circle cx="25" cy="25" r="20" strokeDasharray="35 100" strokeLinecap="round">
+                        <animateTransform attributeName="transform" type="rotate" repeatCount="indefinite" dur="1s" from="0 25 25" to="360 25 25" />
+                      </circle>
+                    </svg>
+                    <p style={styles.processingText}>AI Processing in Progress...</p>
+                  </div>
+                )}
+                {videoUrl ? (
+                  <video
+                    ref={videoRef}
+                    src={videoUrl || undefined}
+                    controls
+                    style={styles.video}
+                    onTimeUpdate={handleTimeUpdate}
+                    onLoadedMetadata={handleLoadedMetadata}
+                    poster="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='640' height='360' viewBox='0 0 640 360'%3E%3Crect width='640' height='360' fill='%23030A0A'/%3E%3Ctext x='50%25' y='50%25' font-size='16' fill='%2338F0B0' text-anchor='middle' dy='.3em' font-family='monospace'%3ETrajectory Preview%3C/text%3E%3C/svg%3E"
+                  >
+                    Your browser does not support the video tag.
+                  </video>
+                ) : (
+                  <div style={styles.dropZone} onClick={() => fileInputRef.current?.click()}>
+                    <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="#38F0B0" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" style={{marginBottom: '1rem'}}>
+                      <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+                      <polyline points="17 8 12 3 7 8"></polyline>
+                      <line x1="12" y1="3" x2="12" y2="15"></line>
+                    </svg>
+                    <p style={styles.dropZoneText}>Drag & drop your video here, or <span style={styles.browseLink}>click to browse</span></p>
+                  </div>
+                )}
               </div>
 
-              <div style={styles.infoText}>
-                Processed video is playing inline. Use the download link below if you want to save it.
+              <div style={styles.statusBar}>
+                <span style={styles.statusText}>{statusText}</span>
               </div>
-              <button style={styles.downloadBtn} onClick={handleDownload}>
-                Download predicted video
-              </button>
+              <div style={styles.actionRow}>
+                <button
+                  style={{ ...styles.predictActionBtn, ...(isProcessing || !selectedFile ? styles.disabledBtn : {}) }}
+                  onClick={startPrediction}
+                  disabled={isProcessing || !selectedFile}
+                >
+                  {isProcessing ? 'Processing...' : 'Start Prediction'}
+                </button>
+                <button 
+                  style={{ ...styles.iconBtn, ...(!isProcessed || !downloadUrl ? styles.disabledBtn : {}) }} 
+                  onClick={handleDownload}
+                  disabled={!isProcessed || !downloadUrl}
+                  title="Download predicted video"
+                >
+                  <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                    <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+                    <polyline points="7 10 12 15 17 10"></polyline>
+                    <line x1="12" y1="15" x2="12" y2="3"></line>
+                  </svg>
+                </button>
+              </div>
             </div>
 
             {/* Stats Panels */}
@@ -262,10 +324,6 @@ const CricketTrajectoryPredictor: React.FC = () => {
 
               <div style={styles.statsPanel}>
                 <div style={styles.statsTitle}>BOWL TRAJECTORY METRICS</div>
-                <div style={styles.statItem}>
-                  <span style={styles.statLabel}>Peak apex height</span>
-                  <span style={styles.statNumber}>2.43 m</span>
-                </div>
                 <div style={styles.statItem}>
                   <span style={styles.statLabel}>Launch angle (avg)</span>
                   <span style={styles.statNumber}>14.2Â°</span>
@@ -348,6 +406,25 @@ const styles: { [key: string]: React.CSSProperties } = {
     fontWeight: 500,
     fontSize: '0.85rem',
     marginTop: '0.4rem',
+  },
+  headerActions: {
+    display: 'flex',
+    flexDirection: 'column',
+    alignItems: 'flex-end',
+    gap: '8px',
+  },
+  homeButton: {
+    display: 'flex',
+    alignItems: 'center',
+    background: '#142A24',
+    border: '1px solid #2DAA7A',
+    padding: '0.45rem 1rem',
+    borderRadius: '40px',
+    color: '#EEF5F0',
+    textDecoration: 'none',
+    fontWeight: 700,
+    fontSize: '0.85rem',
+    transition: 'all 0.2s',
   },
   badge: {
     background: 'rgba(30, 55, 50, 0.7)',
@@ -479,6 +556,56 @@ const styles: { [key: string]: React.CSSProperties } = {
     display: 'flex',
     justifyContent: 'center',
     alignItems: 'center',
+    border: '2px dashed transparent',
+    transition: 'all 0.3s ease',
+    minHeight: 250,
+  },
+  videoWrapperDragging: {
+    border: '2px dashed #38F0B0',
+    background: '#0A1A18',
+  },
+  dropZone: {
+    display: 'flex',
+    flexDirection: 'column',
+    alignItems: 'center',
+    justifyContent: 'center',
+    width: '100%',
+    height: '100%',
+    padding: '3rem',
+    cursor: 'pointer',
+  },
+  dropZoneText: {
+    color: '#8FBEAE',
+    fontSize: '0.9rem',
+    fontWeight: 500,
+    margin: 0,
+    textAlign: 'center',
+  },
+  browseLink: {
+    color: '#38F0B0',
+    textDecoration: 'underline',
+    fontWeight: 700,
+  },
+  processingOverlay: {
+    position: 'absolute' as 'absolute',
+    top: 0,
+    left: 0,
+    width: '100%',
+    height: '100%',
+    background: 'rgba(3, 10, 10, 0.85)',
+    backdropFilter: 'blur(4px)',
+    display: 'flex',
+    flexDirection: 'column' as 'column',
+    alignItems: 'center',
+    justifyContent: 'center',
+    zIndex: 10,
+  },
+  processingText: {
+    color: '#38F0B0',
+    marginTop: '1.2rem',
+    fontWeight: 600,
+    letterSpacing: '1px',
+    fontSize: '0.95rem',
   },
   video: {
     width: '100%',
@@ -512,17 +639,37 @@ const styles: { [key: string]: React.CSSProperties } = {
     color: '#8FBEAE',
     textAlign: 'center',
   },
-  downloadBtn: {
+  actionRow: {
+    display: 'flex',
+    gap: '12px',
+    marginTop: '16px',
+    width: '100%',
+  },
+  predictActionBtn: {
+    background: '#142A24',
+    border: '1.5px solid #38F0B0',
+    padding: '0.7rem 1.6rem',
+    borderRadius: '40px',
+    fontWeight: 800,
+    color: '#EEF5F0',
+    fontFamily: 'inherit',
+    cursor: 'pointer',
+    transition: 'all 0.2s',
+    fontSize: '0.9rem',
+    flex: 1,
+    boxShadow: '0 4px 15px rgba(56, 240, 176, 0.2)',
+  },
+  iconBtn: {
     background: 'transparent',
     border: '1.5px solid #2DAA7A',
     color: '#C0F5E0',
-    padding: '0.7rem 1rem',
-    borderRadius: '40px',
-    fontWeight: 700,
-    fontSize: '0.85rem',
+    width: '48px',
+    height: '48px',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderRadius: '50%',
     cursor: 'pointer',
-    width: '100%',
-    marginTop: '12px',
     transition: 'all 0.2s',
   },
   infoCard: {
