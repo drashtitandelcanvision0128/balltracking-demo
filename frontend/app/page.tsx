@@ -1,5 +1,13 @@
 "use client";
 import React, { useState, useRef, useCallback, useEffect } from 'react';
+import Link from 'next/link';
+
+interface Player {
+  id: string;
+  name: string;
+  role: string;
+  style: string;
+}
 
 const CricketTrajectoryPredictor: React.FC = () => {
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
@@ -12,11 +20,82 @@ const CricketTrajectoryPredictor: React.FC = () => {
   const [framesProcessed, setFramesProcessed] = useState<number>(843);
   const [bounceEvents, setBounceEvents] = useState<number>(78);
   const [deletedBounces, setDeletedBounces] = useState<number>(78);
+  const [hitDetected, setHitDetected] = useState<boolean>(false);
   const [videoDuration, setVideoDuration] = useState<number>(0);
   const [currentTime, setCurrentTime] = useState<number>(0);
   const [isDragging, setIsDragging] = useState<boolean>(false);
+  const [isLoggedIn, setIsLoggedIn] = useState<boolean>(false);
+  const [hasMounted, setHasMounted] = useState<boolean>(false);
+  const [showDropdown, setShowDropdown] = useState<boolean>(false);
+  const [selectedPlayer, setSelectedPlayer] = useState<Player | null>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const dropdownRef = useRef<HTMLDivElement>(null);
+  const pollIntervalRef = useRef<NodeJS.Timeout | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (pollIntervalRef.current) clearInterval(pollIntervalRef.current);
+    };
+  }, []);
+
+  useEffect(() => {
+    setHasMounted(true);
+    if (typeof window !== 'undefined') {
+      setIsLoggedIn(localStorage.getItem('userLoggedIn') === 'true');
+      const savedPlayer = localStorage.getItem('selectedPlayer');
+      if (savedPlayer) {
+        setSelectedPlayer(JSON.parse(savedPlayer));
+      }
+    }
+  }, []);
+
+  useEffect(() => {
+    const handleClickOutside = (event: MouseEvent) => {
+      if (dropdownRef.current && !dropdownRef.current.contains(event.target as Node)) {
+        setShowDropdown(false);
+      }
+    };
+    
+    if (showDropdown) {
+      document.addEventListener('mousedown', handleClickOutside);
+    } else {
+      document.removeEventListener('mousedown', handleClickOutside);
+    }
+    
+    return () => {
+      document.removeEventListener('mousedown', handleClickOutside);
+    };
+  }, [showDropdown]);
+
+  useEffect(() => {
+    if (typeof window !== 'undefined' && hasMounted) {
+      let savedJobId = null;
+      if (selectedPlayer) {
+        savedJobId = localStorage.getItem(`active_job_${selectedPlayer.id}`);
+      }
+      
+      if (savedJobId) {
+        setIsProcessing(true);
+        setStatusText('Restoring previous session...');
+        pollJob(savedJobId);
+      } else {
+        if (pollIntervalRef.current) clearInterval(pollIntervalRef.current);
+        setIsProcessing(false);
+        setIsProcessed(false);
+        setHitDetected(false);
+        setVideoUrl('');
+        setDownloadUrl('');
+        setStatusText('Ready. Select a video to analyze trajectory.');
+      }
+    }
+  }, [selectedPlayer, hasMounted]);
+
+  const handleLogout = () => {
+    localStorage.removeItem('userLoggedIn');
+    setIsLoggedIn(false);
+    setShowDropdown(false);
+  };
 
   // Cleanup blob URL on unmount
   useEffect(() => {
@@ -122,6 +201,9 @@ const CricketTrajectoryPredictor: React.FC = () => {
       }
 
       if (data.job_id) {
+        if (selectedPlayer) {
+          localStorage.setItem(`active_job_${selectedPlayer.id}`, data.job_id);
+        }
         setStatusText('Video queued. Waiting for processing...');
         pollJob(data.job_id);
       }
@@ -132,17 +214,38 @@ const CricketTrajectoryPredictor: React.FC = () => {
   };
 
   const pollJob = (jobId: string) => {
-    const pollInterval = setInterval(async () => {
+    if (pollIntervalRef.current) clearInterval(pollIntervalRef.current);
+
+    pollIntervalRef.current = setInterval(async () => {
       try {
         const response = await fetch(`http://localhost:5000/status/${jobId}`);
         const data = await response.json();
+
+        if (!response.ok || data.error) {
+          if (pollIntervalRef.current) clearInterval(pollIntervalRef.current);
+          setStatusText(data.error || 'Job not found or expired.');
+          setIsProcessing(false);
+          const currentPlayer = localStorage.getItem('selectedPlayer');
+          if (currentPlayer) {
+            try {
+              const playerObj = JSON.parse(currentPlayer);
+              localStorage.removeItem(`active_job_${playerObj.id}`);
+            } catch (e) {}
+          }
+          return;
+        }
+
+        if (data.status === 'queued') {
+          setStatusText(`Video in queue... (Position: ${data.queue_position || 1})`);
+          return;
+        }
 
         if (data.status === 'processing') {
           setStatusText('AI processing video frames...');
           return;
         }
 
-        clearInterval(pollInterval);
+        if (pollIntervalRef.current) clearInterval(pollIntervalRef.current);
 
         if (data.status === 'error') {
           setStatusText(data.error || 'Prediction failed');
@@ -153,33 +256,49 @@ const CricketTrajectoryPredictor: React.FC = () => {
         if (data.status === 'done') {
           setFramesProcessed(data.summary?.frames_processed || 0);
           setBounceEvents(Array.isArray(data.summary?.bounce_events) ? data.summary.bounce_events.length : 0);
+          setHitDetected(!!data.summary?.hit_detected);
           setDeletedBounces(0);
           setVideoUrl(`http://localhost:5000${data.video_url}`);
-          setDownloadUrl(`http://localhost:5000${data.download_url}`);
+          setDownloadUrl(`http://localhost:5000${data.video_url}`);
           setStatusText('Prediction complete! Trajectory overlay active.');
           setIsProcessing(false);
           setIsProcessed(true);
         }
       } catch (error: any) {
-        clearInterval(pollInterval);
+        if (pollIntervalRef.current) clearInterval(pollIntervalRef.current);
         setStatusText('Polling failed: ' + error.message);
         setIsProcessing(false);
       }
     }, 2000);
   };
 
-  const handleDownload = () => {
+  const handleDownload = async () => {
     if (!isProcessed || !downloadUrl) {
       setStatusText('No processed video available. Please upload and run prediction first.');
       return;
     }
-    const link = document.createElement('a');
-    link.href = downloadUrl;
-    link.download = `predicted_${selectedFile?.name || 'trajectory_video.mp4'}`;
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
-    setStatusText('Download started: predicted trajectory video.');
+    
+    setStatusText('Preparing download...');
+    try {
+      const response = await fetch(downloadUrl);
+      if (!response.ok) throw new Error('Network response was not ok');
+      const blob = await response.blob();
+      const blobUrl = window.URL.createObjectURL(blob);
+      
+      const link = document.createElement('a');
+      link.href = blobUrl;
+      link.download = `predicted_${selectedFile?.name || 'trajectory_video.mp4'}`;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      
+      window.URL.revokeObjectURL(blobUrl);
+      setStatusText('Download started: predicted trajectory video.');
+    } catch (error) {
+      console.error('Download error:', error);
+      setStatusText('Download failed. Opening in new tab instead.');
+      window.open(downloadUrl, '_blank');
+    }
   };
 
   const formatTime = (seconds: number): string => {
@@ -195,17 +314,86 @@ const CricketTrajectoryPredictor: React.FC = () => {
           {/* Header */}
           <div style={styles.header}>
             <div style={styles.titleSection}>
-              <h1 style={styles.title}><span style={styles.liveIndicator}>AI </span>BOWLER</h1>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '12px', flexWrap: 'wrap' }}>
+                <h1 style={styles.title}><span style={styles.liveIndicator}>AI </span>BOWLER</h1>
+                {selectedPlayer && (
+                  <div style={styles.selectedPlayerBadge}>
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" style={{marginRight: '6px'}}>
+                      <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"></path>
+                      <circle cx="12" cy="7" r="4"></circle>
+                    </svg>
+                    Analysis for: {selectedPlayer.name}
+                    <button 
+                      onClick={(e) => { e.stopPropagation(); localStorage.removeItem('selectedPlayer'); setSelectedPlayer(null); }}
+                      style={{ background: 'transparent', border: 'none', color: '#E04545', marginLeft: '6px', cursor: 'pointer', display: 'flex', alignItems: 'center' }}
+                      title="Clear Selection"
+                    >
+                      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                        <line x1="18" y1="6" x2="6" y2="18"></line>
+                        <line x1="6" y1="6" x2="18" y2="18"></line>
+                      </svg>
+                    </button>
+                  </div>
+                )}
+              </div>
               <p style={styles.subtitle}>Upload a cricket video & AI-powered trajectory overlay</p>
             </div>
             <div style={styles.headerActions}>
-              <a href="https://aibowler.in/" style={styles.homeButton}>
-                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{marginRight: '6px'}}>
-                  <path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"></path>
-                  <polyline points="9 22 9 12 15 12 15 22"></polyline>
-                </svg>
-                Home
-              </a>
+              <div style={{display: 'flex', gap: '10px', alignItems: 'center'}}>
+                {hasMounted && (isLoggedIn ? (
+                  <div style={{ position: 'relative' }} ref={dropdownRef}>
+                    <div 
+                      style={{...styles.userProfile, cursor: 'pointer', ...(showDropdown ? { background: 'rgba(56, 240, 176, 0.2)' } : {})}} 
+                      onClick={() => setShowDropdown(!showDropdown)}
+                    >
+                      <div style={styles.userIcon} title="Logged In User">
+                        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#0A1216" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                          <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"></path>
+                          <circle cx="12" cy="7" r="4"></circle>
+                        </svg>
+                      </div>
+                    </div>
+                    
+                    {showDropdown && (
+                      <div style={styles.dropdownMenu}>
+                        <Link href="/players" style={{...styles.dropdownItem, color: '#38F0B0', textDecoration: 'none', marginBottom: '4px'}}>
+                          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{marginRight: '8px'}}>
+                            <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"></path>
+                            <circle cx="9" cy="7" r="4"></circle>
+                            <path d="M23 21v-2a4 4 0 0 0-3-3.87"></path>
+                            <path d="M16 3.13a4 4 0 0 1 0 7.75"></path>
+                          </svg>
+                          My Players
+                        </Link>
+                        <button onClick={handleLogout} style={styles.dropdownItem}>
+                          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{marginRight: '8px'}}>
+                            <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"></path>
+                            <polyline points="16 17 21 12 16 7"></polyline>
+                            <line x1="21" y1="12" x2="9" y2="12"></line>
+                          </svg>
+                          Sign Out
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                ) : (
+                  <>
+                    <Link href="/login" style={styles.authButton}>
+                      Sign In
+                    </Link>
+                    <Link href="/register" style={{...styles.authButton, ...styles.authPrimaryButton}}>
+                      Register
+                    </Link>
+                  </>
+                ))}
+                <a href="https://aibowler.in/" style={styles.homeButton}>
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{marginRight: '6px'}}>
+                    <path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"></path>
+                    <polyline points="9 22 9 12 15 12 15 22"></polyline>
+                  </svg>
+                  Home
+                </a>
+              </div>
               <div style={styles.badge}>
                 <span style={styles.badgeText}>PREDICTION ENGINE <span style={styles.liveIndicator}>● ACTIVE</span></span>
               </div>
@@ -278,6 +466,27 @@ const CricketTrajectoryPredictor: React.FC = () => {
                 <span style={styles.statusText}>{statusText}</span>
               </div>
               <div style={styles.actionRow}>
+                {selectedFile && (
+                  <button
+                    style={styles.cancelBtn}
+                    onClick={() => {
+                      setSelectedFile(null);
+                      setFileName('video.mp4');
+                      if (videoUrl && videoUrl.startsWith('blob:')) {
+                        URL.revokeObjectURL(videoUrl);
+                      }
+                      setVideoUrl('');
+                      setStatusText('Selection cancelled.');
+                      setIsProcessing(false);
+                      setIsProcessed(false);
+                      if (fileInputRef.current) {
+                        fileInputRef.current.value = '';
+                      }
+                    }}
+                  >
+                    Cancel
+                  </button>
+                )}
                 <button
                   style={{ ...styles.predictActionBtn, ...(isProcessing || !selectedFile ? styles.disabledBtn : {}) }}
                   onClick={startPrediction}
@@ -311,6 +520,10 @@ const CricketTrajectoryPredictor: React.FC = () => {
                 <div style={styles.statItem}>
                   <span style={styles.statLabel}>Bounce events detected</span>
                   <span style={styles.statNumber}>{bounceEvents}</span>
+                </div>
+                <div style={styles.statItem}>
+                  <span style={styles.statLabel}>Shot Type</span>
+                  <span style={{ ...styles.statNumber, color: hitDetected ? '#38F0B0' : '#F03870' }}>{hitDetected ? 'HIT' : 'MISS / NO HIT'}</span>
                 </div>
                 <div style={styles.statItem}>
                   <span style={styles.statLabel}>Deleted bounce events</span>
@@ -407,6 +620,18 @@ const styles: { [key: string]: React.CSSProperties } = {
     fontSize: '0.85rem',
     marginTop: '0.4rem',
   },
+  selectedPlayerBadge: {
+    display: 'flex',
+    alignItems: 'center',
+    background: 'rgba(56, 240, 176, 0.15)',
+    border: '1px solid rgba(56, 240, 176, 0.4)',
+    color: '#38F0B0',
+    padding: '4px 10px',
+    borderRadius: '20px',
+    fontSize: '0.75rem',
+    fontWeight: 700,
+    marginTop: '4px',
+  },
   headerActions: {
     display: 'flex',
     flexDirection: 'column',
@@ -425,6 +650,70 @@ const styles: { [key: string]: React.CSSProperties } = {
     fontWeight: 700,
     fontSize: '0.85rem',
     transition: 'all 0.2s',
+  },
+  authButton: {
+    display: 'flex',
+    alignItems: 'center',
+    background: 'transparent',
+    border: '1px solid rgba(60, 210, 140, 0.5)',
+    padding: '0.45rem 1rem',
+    borderRadius: '40px',
+    color: '#38F0B0',
+    textDecoration: 'none',
+    fontWeight: 600,
+    fontSize: '0.85rem',
+    transition: 'all 0.2s',
+  },
+  authPrimaryButton: {
+    background: '#38F0B0',
+    color: '#071212',
+    border: '1px solid #38F0B0',
+    fontWeight: 700,
+  },
+  userProfile: {
+    display: 'flex',
+    alignItems: 'center',
+    background: 'rgba(56, 240, 176, 0.1)',
+    border: '1px solid rgba(56, 240, 176, 0.3)',
+    borderRadius: '50%',
+    padding: '4px',
+    transition: 'all 0.2s',
+  },
+  userIcon: {
+    background: '#38F0B0',
+    borderRadius: '50%',
+    width: '32px',
+    height: '32px',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  dropdownMenu: {
+    position: 'absolute',
+    top: '120%',
+    right: 0,
+    background: '#0F1A1A',
+    border: '1px solid rgba(56, 240, 176, 0.3)',
+    borderRadius: '12px',
+    padding: '8px',
+    minWidth: '140px',
+    boxShadow: '0 8px 24px rgba(0,0,0,0.6)',
+    zIndex: 50,
+  },
+  dropdownItem: {
+    display: 'flex',
+    alignItems: 'center',
+    width: '100%',
+    background: 'transparent',
+    border: 'none',
+    color: '#E04545',
+    cursor: 'pointer',
+    padding: '10px 12px',
+    borderRadius: '8px',
+    fontSize: '0.85rem',
+    fontWeight: 600,
+    transition: 'background 0.2s',
+    textAlign: 'left',
   },
   badge: {
     background: 'rgba(30, 55, 50, 0.7)',
@@ -644,6 +933,18 @@ const styles: { [key: string]: React.CSSProperties } = {
     gap: '12px',
     marginTop: '16px',
     width: '100%',
+  },
+  cancelBtn: {
+    background: 'transparent',
+    border: '1.5px solid #E04545',
+    padding: '0.7rem 1.6rem',
+    borderRadius: '40px',
+    fontWeight: 800,
+    color: '#E04545',
+    fontFamily: 'inherit',
+    cursor: 'pointer',
+    transition: 'all 0.2s',
+    fontSize: '0.9rem',
   },
   predictActionBtn: {
     background: '#142A24',

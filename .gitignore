@@ -1,2 +1,8 @@
 cricket_ball_data
 myenv
+uploads/
+backend/uploads/
+*.mp4
+
+__pycache__/
+*.log
