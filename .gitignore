@@ -6,3 +6,4 @@ backend/uploads/
 
 __pycache__/
 *.log
+backend/__pycache__/predict_server.cpython-314.pyc
