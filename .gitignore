@@ -1,2 +1,9 @@
 cricket_ball_data
 myenv
+uploads/
+backend/uploads/
+*.mp4
+
+__pycache__/
+*.log
+backend/__pycache__/predict_server.cpython-314.pyc

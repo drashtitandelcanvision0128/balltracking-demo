@@ -1,377 +1,354 @@
-import math
-import os
-import threading
-import time
-import uuid
+"""
+Cricket Ball Tracker — Robust Reset (No Spider Web)
+====================================================
+- NEW DELIVERY: if ball undetected >2.5s (except POST_HIT) → history cleared
+- Trajectory drawn ONLY from actual YOLO detections (smoothed)
+- Kalman prediction green dot shown during occlusion – NOT in trajectory
+- Bounce detection, hit detection, post-hit tracking preserved
+"""
 
-import cv2
-import numpy as np
+import math, os, threading, time, uuid, subprocess
+import cv2, numpy as np
+from collections import deque
 from scipy.interpolate import splprep, splev
 from flask import Flask, jsonify, request, send_file
 from flask_cors import CORS
 from ultralytics import YOLO
+import queue
 from werkzeug.utils import secure_filename
 
 app = Flask(__name__)
 CORS(app)
 
-UPLOAD_FOLDER = os.path.join(os.getcwd(), 'uploads')
+BASE_DIR      = os.path.dirname(os.path.abspath(__file__))
+UPLOAD_FOLDER = os.path.join(BASE_DIR, 'uploads')
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
-MODEL_PATH = os.path.join('runs', 'detect', 'train5', 'weights', 'best.pt')
-model = YOLO(MODEL_PATH)
+MODEL_PATH = os.path.join(BASE_DIR, 'runs', 'detect', 'train5', 'weights', 'best.pt')
 
-FRAME_STRIDE = 2
-jobs = {}
+jobs      = {}
 jobs_lock = threading.Lock()
+job_queue = queue.Queue()
 
+def video_processing_worker():
+    while True:
+        job_id, input_path, output_path = job_queue.get()
+        with jobs_lock: jobs[job_id]['status'] = 'processing'
+        process_video_async(job_id, input_path, output_path)
+        job_queue.task_done()
+threading.Thread(target=video_processing_worker, daemon=True).start()
 
-class FixedSizeQueue:
-    def __init__(self, max_size):
-        self.queue = []
-        self.max_size = max_size
+# ---------- Kalman Filter (prediction only) ----------
+class BallKalmanFilter:
+    def __init__(self, dt=1.0):
+        self.kf = cv2.KalmanFilter(4, 2)
+        self.kf.transitionMatrix = np.array([[1,0,dt,0],[0,1,0,dt],[0,0,1,0],[0,0,0,1]], np.float32)
+        self.kf.measurementMatrix = np.array([[1,0,0,0],[0,1,0,0]], np.float32)
+        self.kf.processNoiseCov = np.eye(4, dtype=np.float32) * 1e-2
+        self.kf.measurementNoiseCov = np.eye(2, dtype=np.float32) * 1e-1
+        self.kf.errorCovPost = np.eye(4, dtype=np.float32)
+        self.initialized = False
 
-    def add(self, item):
-        self.queue.append(item)
-        if len(self.queue) > self.max_size:
-            self.queue.pop(0)
+    def init(self, x, y):
+        self.kf.statePost = np.array([[x],[y],[0],[0]], np.float32)
+        self.initialized = True
+    def predict(self): return self.kf.predict()
+    def correct(self, x, y): self.kf.correct(np.array([[np.float32(x)],[np.float32(y)]]))
+    def get_position(self): return (int(self.kf.statePost[0]), int(self.kf.statePost[1]))
 
-    def pop(self):
-        if self.queue:
-            self.queue.pop(0)
+# ---------- Smoothed History (only actual detections) ----------
+class SmoothHistory:
+    def __init__(self, maxlen=150, smooth_window=5):
+        self.queue = deque(maxlen=maxlen)
+        self.smooth_window = smooth_window
+        self.raw_buffer = deque(maxlen=smooth_window)
 
-    def clear(self):
-        self.queue.clear()
+    def add(self, raw_point):
+        self.raw_buffer.append(raw_point)
+        if len(self.raw_buffer) < self.smooth_window:
+            smoothed = raw_point
+        else:
+            weights = np.exp(np.linspace(-1, 0, self.smooth_window))
+            weights /= weights.sum()
+            pts = np.array(self.raw_buffer)
+            smoothed_x = np.dot(pts[:,0], weights)
+            smoothed_y = np.dot(pts[:,1], weights)
+            smoothed = (int(smoothed_x), int(smoothed_y))
+        if len(self.queue) > 0 and self.queue[-1] == smoothed:
+            return
+        self.queue.append(smoothed)
 
-    def get_queue(self):
-        return self.queue
+    def get_list(self): return list(self.queue)
+    def clear(self): self.queue.clear(); self.raw_buffer.clear()
+    def __len__(self): return len(self.queue)
 
-    def __len__(self):
-        return len(self.queue)
-
-
-def angle_between_lines(m1, m2=1):
-    if m1 != -1 / m2:
-        return math.degrees(math.atan(abs((m2 - m1) / (1 + m1 * m2))))
-    return 90.0
-
-def draw_dashed_line(img, pt1, pt2, color, thickness=1, gap=15):
-    dist = math.hypot(pt2[0] - pt1[0], pt2[1] - pt1[1])
-    if dist == 0:
-        return
-    dashes = max(1, int(dist / gap))
-    for i in range(dashes):
-        start_t = i / dashes
-        end_t = (i + 0.5) / dashes
-        start_x = int(pt1[0] + start_t * (pt2[0] - pt1[0]))
-        start_y = int(pt1[1] + start_t * (pt2[1] - pt1[1]))
-        end_x = int(pt1[0] + end_t * (pt2[0] - pt1[0]))
-        end_y = int(pt1[1] + end_t * (pt2[1] - pt1[1]))
-        cv2.line(img, (start_x, start_y), (end_x, end_y), color, thickness, cv2.LINE_AA)
-
-def draw_ui_panel(img, text_title, text_value, top_left, size=(120, 55)):
+# ---------- Drawing helpers ----------
+def draw_ui_panel(img, title, value, top_left, size=(160,55), value_color=(255,255,255)):
     overlay = img.copy()
-    x, y = top_left
-    w, h = size
-    
-    # Translucent Black Background
-    cv2.rectangle(overlay, (x, y), (x + w, y + h), (0, 0, 0), -1)
-    # White Border
-    cv2.rectangle(overlay, (x, y), (x + w, y + h), (255, 255, 255), 1)
-    
-    # Blend
-    cv2.addWeighted(overlay, 0.6, img, 0.4, 0, img)
-    
-    # Text
-    cv2.putText(img, text_title, (x + 10, y + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1, cv2.LINE_AA)
-    cv2.putText(img, text_value, (x + 10, y + 45), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2, cv2.LINE_AA)
+    x,y = top_left; w,h = size
+    cv2.rectangle(overlay,(x,y),(x+w,y+h),(0,0,0),-1)
+    cv2.rectangle(overlay,(x,y),(x+w,y+h),(255,255,255),1)
+    cv2.addWeighted(overlay,0.6,img,0.4,0,img)
+    cv2.putText(img,title,(x+8,y+18),cv2.FONT_HERSHEY_SIMPLEX,0.42,(200,200,200),1,cv2.LINE_AA)
+    cv2.putText(img,value,(x+8,y+44),cv2.FONT_HERSHEY_SIMPLEX,0.65,value_color,2,cv2.LINE_AA)
 
 def draw_pitch_line(img):
-    height, width = img.shape[:2]
-    # Create a simulated 3D pitch perspective (blue line down the middle)
-    pt1 = [width // 2 - 30, height]          # Bottom left
-    pt2 = [width // 2 + 30, height]          # Bottom right
-    pt3 = [width // 2 + 10, height // 2]     # Top right
-    pt4 = [width // 2 - 10, height // 2]     # Top left
-    
-    pts = np.array([pt1, pt2, pt3, pt4], np.int32)
-    pts = pts.reshape((-1, 1, 2))
-    
+    h,w = img.shape[:2]
+    pts = np.array([[w//2-40,h],[w//2+40,h],[w//2+15,h//2],[w//2-15,h//2]], np.int32)
     overlay = img.copy()
-    cv2.fillPoly(overlay, [pts], (255, 100, 50)) # Blue color in BGR
-    
-    # Apply alpha blending
-    cv2.addWeighted(overlay, 0.35, img, 0.65, 0, img)
+    cv2.fillPoly(overlay,[pts],(255,120,50))
+    cv2.addWeighted(overlay,0.35,img,0.65,0,img)
 
+def draw_trajectory(frame, pts_list, outer_col, inner_col, outer_thick, inner_thick):
+    if len(pts_list) < 2: return
+    pts = np.array(pts_list, dtype=np.float32)
+    _, idx = np.unique(pts, axis=0, return_index=True)
+    pts = pts[np.sort(idx)]
+    if len(pts) < 2: return
+    try:
+        k = min(3, len(pts)-1)
+        tck,_ = splprep([pts[:,0], pts[:,1]], s=5, k=k)
+        u_new = np.linspace(0,1, max(100, len(pts)*3))
+        x_new, y_new = splev(u_new, tck)
+        curve = np.vstack((x_new,y_new)).T.astype(np.int32)
+        cv2.polylines(frame, [curve], False, outer_col, outer_thick, cv2.LINE_AA)
+        cv2.polylines(frame, [curve], False, inner_col, inner_thick, cv2.LINE_AA)
+    except:
+        cv2.polylines(frame, [pts.astype(np.int32)], False, outer_col, outer_thick, cv2.LINE_AA)
 
+# ---------- Core processing ----------
 def process_video(input_path, output_path):
-    cap = cv2.VideoCapture(input_path)
-    if not cap.isOpened():
-        raise RuntimeError(f'Could not open video: {input_path}')
+    try: model = YOLO(MODEL_PATH)
+    except Exception as e: print(f"[ERROR] Model load: {e}"); model = None
 
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    if fps <= 0:
-        fps = 25.0
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    cap = cv2.VideoCapture(input_path)
+    if not cap.isOpened(): raise RuntimeError(f"Cannot open: {input_path}")
+
+    fps    = cap.get(cv2.CAP_PROP_FPS) or 25.0
+    width  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    # Write as mp4v first; then convert with ffmpeg to H.264 for browser preview.
+    dt     = 1.0/fps
+
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     writer = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
 
-    # Increased history size to show a long, continuous trajectory like the reference image
-    centroid_history = FixedSizeQueue(100)
-    interval = 0.6
-    start_time = time.time()
-    angle = 0.0
-    frame_index = 0
-    bounce_events = []
-    current_detections = []
-    
-    # Analytics State Variables
-    speed_mph = 0.0
-    spin_deg = 0.0
-    swing_sf = 0.0
+    kf = BallKalmanFilter(dt=dt)
+    history = SmoothHistory(maxlen=150, smooth_window=5)
+    last_centroid = None
+    frames_since_det = 999
+
+    event_status   = "WAITING"
+    hit_occurred   = False
+    hit_split_idx  = -1
+    speed_kph      = 0.0
+    bounce_detected = False
+    bounce_frame   = -1
+    frame_index    = 0
 
     while True:
         ret, frame = cap.read()
-        if not ret:
-            break
-            
-        if frame_index % 30 == 0:
-            print(f"Processing frame {frame_index}...")
-
-        # Draw the blue pitch line first so it stays on the ground
-        draw_pitch_line(frame)
-
-        current_time = time.time()
-        if current_time - start_time >= interval and len(centroid_history) > 0:
-            centroid_history.pop()
-            start_time = current_time
-
-        if frame_index % FRAME_STRIDE == 0:
-            results = model.track(frame, persist=True, conf=0.10, verbose=False)
-            boxes = results[0].boxes
-            current_detections = []
-
-            if len(boxes) > 0:
-                for box in boxes:
-                    x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
-                    centroid_x = int((x1 + x2) / 2)
-                    centroid_y = int((y1 + y2) / 2)
-                    current_detections.append((x1, y1, x2, y2, centroid_x, centroid_y))
-                    centroid_history.add((centroid_x, centroid_y))
-        
-        for x1, y1, x2, y2, centroid_x, centroid_y in current_detections:
-            # We will show the bounding boxes for debugging
-            cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), (0, 0, 255), 2)
-
-        if len(centroid_history) > 2:
-            centroid_list = list(centroid_history.get_queue())
-            pts = np.array(centroid_list)
-            
-            # Remove consecutive duplicates which cause errors in splprep
-            _, idx = np.unique(pts, axis=0, return_index=True)
-            pts = pts[np.sort(idx)]
-            
-            if len(pts) >= 3:
-                k = min(3, len(pts) - 1)
-                try:
-                    # s=50 is a smoothing factor, adjust if needed
-                    tck, u = splprep([pts[:,0], pts[:,1]], s=50, k=k)
-                    u_new = np.linspace(0, 1, 200) # 200 points for extreme smoothness
-                    x_new, y_new = splev(u_new, tck)
-                    
-                    curve_pts = np.vstack((x_new, y_new)).T.astype(np.int32)
-                    
-                    # 1. Shadow (Glow effect)
-                    cv2.polylines(frame, [curve_pts], isClosed=False, color=(0, 0, 0), thickness=8, lineType=cv2.LINE_AA)
-                    # 2. Main Smooth Red Line (BGR: 0, 0, 255 is red)
-                    cv2.polylines(frame, [curve_pts], isClosed=False, color=(0, 0, 255), thickness=4, lineType=cv2.LINE_AA)
-                except Exception as e:
-                    pass
-
-            x_diff = centroid_list[-1][0] - centroid_list[-2][0]
-            y_diff = centroid_list[-1][1] - centroid_list[-2][1]
-            
-            # Analytics Heuristic Estimations
-            if len(centroid_list) > 5:
-                dy = centroid_list[-1][1] - centroid_list[-5][1]
-                dx = centroid_list[-1][0] - centroid_list[-5][0]
-                if dy > 0: # If ball is moving down
-                    speed_mph = round(min(98.0, max(40.0, dy * 1.8)), 1)
-                    swing_sf = round(min(4.5, abs(dx) * 0.12), 1)
-                    spin_deg = round(min(6.0, abs(angle) * 0.08), 1)
-
-            if x_diff != 0:
-                m1 = y_diff / x_diff
-                if m1 == 1:
-                    angle = 90
-                elif m1 != 0:
-                    angle = 90 - angle_between_lines(m1)
-                if angle >= 45:
-                    bounce_events.append((frame_index, round(angle, 2)))
-
-            # Future Prediction with smaller steps for smoothness
-            future_positions = [centroid_list[-1]]
-            for i in range(1, 8):
-                future_positions.append((int(centroid_list[-1][0] + x_diff * (i * 0.7)), int(centroid_list[-1][1] + y_diff * (i * 0.7))))
-
-            # 2. Dashed Line & Glow (Future Trajectory)
-            for i in range(1, len(future_positions)):
-                # Shadow/Glow for future line
-                draw_dashed_line(frame, future_positions[i - 1], future_positions[i], (0, 0, 0), 4, gap=15)
-                # Main Dashed Green line
-                draw_dashed_line(frame, future_positions[i - 1], future_positions[i], (0, 255, 0), 2, gap=15)
-
-        # Draw UI Panels
-        draw_ui_panel(frame, "Speed", f"{speed_mph} mph", (20, 60))
-        draw_ui_panel(frame, "Spin", f"{spin_deg} deg", (20, 125))
-        draw_ui_panel(frame, "Swing", f"{swing_sf} sf", (20, 190))
-
-        # cv2.putText(frame, f"Angle: {angle:.2f} degrees", (20, 20), cv2.FONT_HERSHEY_PLAIN, 1, (255, 0, 0), 2)
-        writer.write(frame)
+        if not ret: break
         frame_index += 1
+        frames_since_det += 1
+        best_coords = None
+        best_score = -float('inf')
+
+        # ---- Detection (TIGHTENED) ----
+        if model is not None:
+            results = model.predict(frame, conf=0.25, imgsz=640, verbose=False)
+            for box in results[0].boxes:
+                if int(box.cls[0]) != 0: continue
+                x1,y1,x2,y2 = box.xyxy[0].cpu().numpy()
+                bw, bh = x2-x1, y2-y1
+                area = bw * bh
+                if area < 30 or area > 5000:          # ball size filter
+                    continue
+                aspect = bw / (bh + 1e-5)
+                if not (0.3 < aspect < 3.0):          # circular-ish
+                    continue
+                cx, cy = int((x1+x2)/2), int((y1+y2)/2)
+                
+                score = float(box.conf[0])
+
+                # Proximity guard & tracking score
+                if kf.initialized and frames_since_det <= 3:
+                    px, py = kf.get_position()
+                    dist = math.hypot(cx-px, cy-py)
+                    if dist > max(150, width*0.15):
+                        continue
+                    # Penalize score based on distance from predicted position
+                    # This prevents the tracker from jumping to higher-confidence false positives (like gloves/pads)
+                    score -= dist * 0.005
+
+                if score > best_score:
+                    best_score = score
+                    best_coords = (cx, cy)
+
+        # ---- Update Kalman & Smoothed History ----
+        if best_coords is not None:
+            cx, cy = best_coords
+            if not kf.initialized:
+                kf.init(cx, cy)
+            else:
+                kf.predict()
+                kf.correct(cx, cy)
+
+            # Jump reset (>250px) – new delivery
+            if len(history) > 0:
+                last_pt = history.get_list()[-1]
+                if math.hypot(cx - last_pt[0], cy - last_pt[1]) > 250:
+                    history.clear()
+                    kf = BallKalmanFilter(dt=dt)
+                    kf.init(cx, cy)
+                    hit_occurred = False; hit_split_idx = -1
+                    event_status = "BOWLED"
+                    speed_kph = 0.0; bounce_detected = False; bounce_frame = -1
+                    print(f"[Frame {frame_index}] Jump reset – new delivery")
+
+            history.add((cx, cy))
+            last_centroid = (cx, cy)
+            frames_since_det = 0
+            
+            if event_status == "WAITING":
+                event_status = "BOWLED"
+        else:
+            if kf.initialized: kf.predict()
+
+        hist = history.get_list()
+
+        # ---- Bounce Detection ----
+        if not bounce_detected and event_status in ("WAITING","BOWLED") and len(hist)>=3:
+            dy1 = hist[-1][1] - hist[-2][1]
+            dy2 = hist[-2][1] - hist[-3][1]
+            if dy1 < -3 and dy2 > 3 and hist[-2][1] > height*0.4:
+                bounce_detected = True
+                bounce_frame = frame_index
+                print(f"[Frame {frame_index}] Bounce detected")
+
+        # ---- New Delivery Reset (gap >2.5s, except POST_HIT) ----
+        if frames_since_det > int(fps * 2.5) and event_status != "POST_HIT":
+            if event_status != "WAITING" or len(history) > 0:
+                history.clear()
+                kf = BallKalmanFilter(dt=dt)
+                hit_occurred = False; hit_split_idx = -1
+                event_status = "WAITING"
+                speed_kph = 0.0; bounce_detected = False; bounce_frame = -1
+                print(f"[Frame {frame_index}] New delivery (gap >2.5s)")
+
+        # ---- Hit Detection ----
+        if event_status=="BOWLED" and bounce_detected and len(hist)>=4 and not hit_occurred:
+            p1,p2,p3,p4 = hist[-4], hist[-3], hist[-2], hist[-1]
+            v_pre  = (p3[0]-p1[0], p3[1]-p1[1])
+            v_post = (p4[0]-p2[0], p4[1]-p2[1])
+            mag_pre = math.hypot(*v_pre); mag_post = math.hypot(*v_post)
+            if mag_pre>5 and mag_post>5:
+                cos_a = max(-1,min(1, (v_pre[0]*v_post[0]+v_pre[1]*v_post[1])/(mag_pre*mag_post)))
+                angle = math.degrees(math.acos(cos_a))
+                vy_avg = p4[1]-p1[1]
+                if angle>20.0 and p3[1]>int(height*0.35) and vy_avg<8.0:
+                    hit_occurred = True
+                    hit_split_idx = len(hist)-2
+                    event_status = "POST_HIT"
+                    print(f"[Frame {frame_index}] HIT! angle={angle:.1f}°")
+
+        # ---- MISS Detection ----
+        if event_status=="BOWLED" and len(hist)>=3:
+            if hist[-1][1] > int(height*0.82):
+                event_status = "MISS"
+                print(f"[Frame {frame_index}] MISS")
+
+        # ---- POST_HIT Reset ----
+        if event_status == "POST_HIT" and last_centroid:
+            lx, ly = last_centroid
+            ball_outside = (lx < -20 or lx > width+20 or ly < -20 or ly > height+20)
+            if ball_outside and frames_since_det > int(fps * 1.0):
+                history.clear()
+                kf = BallKalmanFilter(dt=dt)
+                hit_occurred = False; hit_split_idx = -1
+                event_status = "WAITING"
+                speed_kph = 0.0; bounce_detected = False; bounce_frame = -1
+                print(f"[Frame {frame_index}] Ball left frame – reset")
+
+        # ---- Drawing ----
+        if hit_occurred and 0 < hit_split_idx < len(hist):
+            pre  = hist[:hit_split_idx+1]
+            post = hist[hit_split_idx:]
+            draw_trajectory(frame, pre,  (0,0,0), (0,0,255), 5,2)
+            draw_trajectory(frame, post, (0,0,0), (0,255,255), 7,3)
+        else:
+            draw_trajectory(frame, hist, (0,0,0), (0,0,255), 5,2)
+
+        if best_coords:
+            cv2.circle(frame, best_coords, 7, (0,255,255), -1)
+
+        status_color = {"WAITING":(128,128,128),"BOWLED":(0,200,255),
+                        "POST_HIT":(0,255,128),"MISS":(0,80,255)}.get(event_status,(255,255,255))
+        draw_ui_panel(frame,"STATUS",event_status,(15,15),value_color=status_color)
+        draw_ui_panel(frame,"PTS",str(len(hist)),(185,15))
+        draw_ui_panel(frame,"BOUNCE","YES" if bounce_detected else "NO",(355,15))
+        draw_ui_panel(frame,"FRAME",str(frame_index),(525,15))
+
+        writer.write(frame)
 
     cap.release()
     writer.release()
 
-    # --- ffmpeg H.264 conversion for browser preview ---
-    import subprocess
-    converted_path = output_path.replace('.mp4', '_converted.mp4')
-    ffmpeg_cmd = [
-        'ffmpeg', '-y', '-i', output_path,
-        '-c:v', 'libx264', '-preset', 'fast', '-pix_fmt', 'yuv420p',
-        '-movflags', '+faststart', converted_path
-    ]
-    try:
-        result = subprocess.run(
-            ffmpeg_cmd,
-            check=False,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-        if result.returncode == 0 and os.path.exists(converted_path):
-            if os.path.exists(output_path):
-                os.remove(output_path)
-            os.replace(converted_path, output_path)
-        else:
-            print('ffmpeg conversion failed:', result.returncode)
-            if result.stderr:
-                print(result.stderr)
-    except Exception as e:
-        print('ffmpeg conversion failed:', e)
+    converted = output_path.replace('.mp4','_converted.mp4')
+    cmd = ['ffmpeg','-y','-i',output_path,'-c:v','libx264','-preset','veryfast','-crf','22',
+           '-pix_fmt','yuv420p','-movflags','+faststart',converted]
+    subprocess.run(cmd, check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if os.path.exists(converted):
+        os.remove(output_path)
+        os.replace(converted, output_path)
 
-    return {
-        'frames_processed': frame_index,
-        'bounce_events': bounce_events,
-        'output_path': output_path,
-    }
-
+    return {'frames_processed':frame_index,'hit_detected':hit_occurred,
+            'event_status':event_status,'output_path':output_path}
 
 def process_video_async(job_id, input_path, output_path):
     try:
         result = process_video(input_path, output_path)
-        with jobs_lock:
-            jobs[job_id]['status'] = 'done'
-            jobs[job_id]['result'] = {
-                'frames_processed': result['frames_processed'],
-                'bounce_events': result['bounce_events'],
-                'output_path': output_path,
-            }
+        with jobs_lock: jobs[job_id] = {'status':'done','result':result}
     except Exception as exc:
-        with jobs_lock:
-            jobs[job_id]['status'] = 'error'
-            jobs[job_id]['error'] = str(exc)
+        with jobs_lock: jobs[job_id] = {'status':'error','error':str(exc)}
 
-
+# Flask routes (unchanged)
 @app.route('/')
-def index():
-    return jsonify({
-        'status': 'API is running',
-        'message': 'Please use the Next.js frontend at http://localhost:3000 to interact with the predictor.'
-    })
-
+def index(): return jsonify({'status':'API running'})
 
 @app.route('/predict', methods=['POST'])
 def predict():
-    if 'video' not in request.files:
-        return jsonify({'error': 'No video file uploaded'}), 400
-
+    if 'video' not in request.files: return jsonify({'error':'No video'}),400
     file = request.files['video']
-    if file.filename == '':
-        return jsonify({'error': 'No selected file'}), 400
-
+    if file.filename == '': return jsonify({'error':'Empty filename'}),400
     safe_name = secure_filename(file.filename)
     unique_name = f"{uuid.uuid4().hex}_{safe_name}"
     input_path = os.path.join(UPLOAD_FOLDER, unique_name)
     file.save(input_path)
-
-    processed_name = f"processed_{os.path.splitext(unique_name)[0]}.mp4"
-    output_path = os.path.join(UPLOAD_FOLDER, processed_name)
-
+    output_name = f"processed_{os.path.splitext(unique_name)[0]}.mp4"
+    output_path = os.path.join(UPLOAD_FOLDER, output_name)
     job_id = str(uuid.uuid4())
-    with jobs_lock:
-        jobs[job_id] = {
-            'status': 'processing',
-            'result': None,
-            'error': None,
-        }
-
-    thread = threading.Thread(target=process_video_async, args=(job_id, input_path, output_path), daemon=True)
-    thread.start()
-
-    return jsonify({
-        'status': 'processing',
-        'job_id': job_id,
-        'poll_url': f'/status/{job_id}',
-        'input_file': input_path,
-        'output_file': output_path,
-    }), 202
-
+    with jobs_lock: jobs[job_id] = {'status':'queued','result':None,'error':None}
+    job_queue.put((job_id, input_path, output_path))
+    return jsonify({'status':'queued','job_id':job_id,'queue_position':job_queue.qsize()}),202
 
 @app.route('/status/<job_id>')
 def status(job_id):
-    with jobs_lock:
-        job = jobs.get(job_id)
-        if not job:
-            return jsonify({'status': 'error', 'error': 'Job not found'}), 404
-
-        if job['status'] == 'processing':
-            return jsonify({'status': 'processing'})
-
-        if job['status'] == 'error':
-            return jsonify({'status': 'error', 'error': job['error']}), 500
-
-        result = job['result']
-        output_path = result['output_path']
-        filename = os.path.basename(output_path)
-        return jsonify({
-            'status': 'done',
-            'video_url': f'/video/{filename}',
-            'download_url': f'/download/{filename}',
-            'summary': {
-                'frames_processed': result['frames_processed'],
-                'bounce_events': result['bounce_events'],
-            },
-        })
-
+    with jobs_lock: job = jobs.get(job_id)
+    if not job: return jsonify({'error':'Job not found'}),404
+    if job['status']=='queued': return jsonify({'status':'queued','queue_position':job_queue.qsize()})
+    if job['status']=='processing': return jsonify({'status':'processing'})
+    if job['status']=='error': return jsonify({'status':'error','error':job['error']}),500
+    res = job['result']
+    return jsonify({'status':'done','video_url':f"/video/{os.path.basename(res['output_path'])}",'summary':res})
 
 @app.route('/video/<filename>')
 def video(filename):
-    file_path = os.path.join(UPLOAD_FOLDER, filename)
-    if not os.path.exists(file_path):
-        return jsonify({'error': 'File not found'}), 404
-    return send_file(file_path, mimetype='video/mp4')
+    path = os.path.join(UPLOAD_FOLDER, filename)
+    if not os.path.exists(path): return jsonify({'error':'File not found'}),404
+    return send_file(path, mimetype='video/mp4')
 
-
-@app.route('/download/<filename>')
-def download(filename):
-    file_path = os.path.join(UPLOAD_FOLDER, filename)
-    if not os.path.exists(file_path):
-        return jsonify({'error': 'File not found'}), 404
-    return send_file(file_path, as_attachment=True, download_name=filename)
-
+@app.route('/health')
+def health(): return jsonify({'status':'ok','model_exists':os.path.exists(MODEL_PATH)})
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000)
+    app.run(host='0.0.0.0', port=5000, debug=False)

@@ -1,0 +1,27 @@
+model:
+  confidence: 0.15
+  image_size: 480
+  path: runs/detect/train5/weights/best.pt
+physics:
+  hit_angle_threshold: 35
+  speed_range:
+  - 50
+  - 95
+  spin_multiplier: 0.4
+  swing_multiplier: 0.2
+processing:
+  ffmpeg_path: ffmpeg
+  max_file_size_mb: 500
+  supported_formats:
+  - .mp4
+  - .avi
+  - .mov
+tracking:
+  lost_threshold: 5
+  max_queue_size: 120
+  max_skip_frames: 10
+  stride: 2
+visualization:
+  show_heatmap: true
+  show_predictions: true
+  trail_length: 30
