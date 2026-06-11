@@ -270,12 +270,15 @@ def process_video(input_path, output_path):
                 print(f"[Frame {frame_index}] Ball left frame – reset")
 
         # ---- Drawing ----
-        if hit_occurred and 0 < hit_split_idx < len(hist):
-            pre  = hist[:hit_split_idx+1]
-            post = hist[hit_split_idx:]
-            draw_trajectory(frame, pre,  (0,0,0), (0,0,255), 5,2)
-            draw_trajectory(frame, post, (0,0,0), (0,255,255), 7,3)
-        else:
+        # if hit_occurred and 0 < hit_split_idx < len(hist):
+        #     pre  = hist[:hit_split_idx+1]
+        #     post = hist[hit_split_idx:]
+        #     draw_trajectory(frame, pre,  (0,0,0), (0,0,255), 5,2)
+        #     draw_trajectory(frame, post, (0,0,0), (0,255,255), 7,3)
+        # else:
+        #     draw_trajectory(frame, hist, (0,0,0), (0,0,255), 5,2)
+        
+        if best_coords is not None:
             draw_trajectory(frame, hist, (0,0,0), (0,0,255), 5,2)
 
         if best_coords:
