@@ -153,9 +153,8 @@ def process_video(input_path, output_path):
     bounce_frame   = -1
     frame_index    = 0
 
-    # Video screen par bounce point ko fix rakhne ke liye variable (raw coords)
-    video_bounce_coords = None
-    video_bounce_label  = 'DOTS'   # Outcome color ke liye — image jaise colored dot
+    # Video screen par sabhi bounce points ko accumulate karne ke liye list
+    persistent_video_bounces = []
 
     # Broadcast-style outcome color map (BGR) — image ki legend se match karta hai
     OUTCOME_COLORS = {
@@ -217,7 +216,6 @@ def process_video(input_path, output_path):
                     hit_occurred = False
                     event_status = "BOWLED"
                     bounce_detected = False; bounce_frame = -1
-                    video_bounce_coords = None
                     print(f"[Frame {frame_index}] Jump reset")
 
             history.add((cx, cy))
@@ -246,12 +244,12 @@ def process_video(input_path, output_path):
 
                 # raw_list[-2] = EXACT bounce pixel — bilkul wahi jahan ball ne ground touch kiya
                 video_bounce_coords = raw_list[-2]
-                video_bounce_label  = ball_label  # Ab defined hai, koi error nahi
 
                 # Global 2D Top-down conversion
                 px_map, py_map = transform_to_pitchmap(video_bounce_coords[0], video_bounce_coords[1])
 
                 session_bounces.append({'coords': (px_map, py_map), 'type': ball_label})
+                persistent_video_bounces.append({'coords': video_bounce_coords, 'label': ball_label})
                 print(f"[Frame {frame_index}] BOUNCE @ raw pixel {video_bounce_coords} | dy_down={dy2_raw:.1f} dy_up={dy1_raw:.1f}")
 
         # ---- Reset Logic ----
@@ -275,12 +273,12 @@ def process_video(input_path, output_path):
                     hit_occurred = True
                     event_status = "POST_HIT"
                     if len(session_bounces) > 0: session_bounces[-1]['type'] = 'RUNS'
-                    video_bounce_label = 'RUNS'   # Dot color update — blue (runs scored)
+                    if len(persistent_video_bounces) > 0: persistent_video_bounces[-1]['label'] = 'RUNS'
 
         if event_status=="BOWLED" and len(hist)>=3 and hist[-1][1] > int(height*0.82):
             event_status = "MISS"
             if len(session_bounces) > 0: session_bounces[-1]['type'] = 'WICKETS'
-            video_bounce_label = 'WICKETS'   # Dot color update — white/gray
+            if len(persistent_video_bounces) > 0: persistent_video_bounces[-1]['label'] = 'WICKETS'
 
         if event_status == "POST_HIT" and best_coords:
             lx, ly = best_coords
@@ -297,19 +295,22 @@ def process_video(input_path, output_path):
             cv2.circle(frame, best_coords, 6, (0, 255, 255), -1, cv2.LINE_AA)
             cv2.circle(frame, best_coords, 6, (0, 0, 0), 1, cv2.LINE_AA)
 
-        # 2. Broadcast-style bounce marker — image jaise colored dot at exact bounce pixel
-        if video_bounce_coords is not None:
-            dot_color = OUTCOME_COLORS.get(video_bounce_label, (20, 20, 20))
+        # 2. Broadcast-style bounce markers (Accumulated for all balls)
+        for bounce in persistent_video_bounces:
+            b_coords = bounce['coords']
+            b_label  = bounce['label']
+            dot_color = OUTCOME_COLORS.get(b_label, (20, 20, 20))
+            
             # Large filled circle — same style as wagonwheel pitch map
-            cv2.circle(frame, video_bounce_coords, 14, dot_color, -1, cv2.LINE_AA)
+            cv2.circle(frame, b_coords, 14, dot_color, -1, cv2.LINE_AA)
             # Dark outline for contrast (broadcast style)
-            cv2.circle(frame, video_bounce_coords, 14, (10, 10, 10), 2, cv2.LINE_AA)
+            cv2.circle(frame, b_coords, 14, (10, 10, 10), 2, cv2.LINE_AA)
             # Tiny highlight dot in center (premium look)
-            cv2.circle(frame, video_bounce_coords, 4, (255, 255, 255), -1, cv2.LINE_AA)
+            cv2.circle(frame, b_coords, 4, (255, 255, 255), -1, cv2.LINE_AA)
 
             # Outcome label text next to the dot
-            label_text = {'DOTS':'DOT','RUNS':'RUN','BOUNDARIES':'BDRY','WICKETS':'OUT'}.get(video_bounce_label, '')
-            tx, ty = video_bounce_coords[0] + 18, video_bounce_coords[1] + 6
+            label_text = {'DOTS':'DOT','RUNS':'RUN','BOUNDARIES':'BDRY','WICKETS':'OUT'}.get(b_label, '')
+            tx, ty = b_coords[0] + 18, b_coords[1] + 6
             cv2.putText(frame, label_text, (tx+1, ty+1), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,0), 2, cv2.LINE_AA)
             cv2.putText(frame, label_text, (tx,   ty),   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 1, cv2.LINE_AA)
 
