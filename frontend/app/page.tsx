@@ -18,8 +18,10 @@ const CricketTrajectoryPredictor: React.FC = () => {
   const [videoUrl, setVideoUrl] = useState<string>('');
   const [downloadUrl, setDownloadUrl] = useState<string>('');
   const [framesProcessed, setFramesProcessed] = useState<number>(843);
-  const [bounceEvents, setBounceEvents] = useState<number>(78);
-  const [deletedBounces, setDeletedBounces] = useState<number>(78);
+  const [bounceEvents, setBounceEvents] = useState<number>(0);
+  const [dotCount, setDotCount] = useState<number>(0);
+  const [runCount, setRunCount] = useState<number>(0);
+  const [deletedBounces, setDeletedBounces] = useState<number>(0);
   const [hitDetected, setHitDetected] = useState<boolean>(false);
   const [videoDuration, setVideoDuration] = useState<number>(0);
   const [currentTime, setCurrentTime] = useState<number>(0);
@@ -241,7 +243,12 @@ const CricketTrajectoryPredictor: React.FC = () => {
         }
 
         if (data.status === 'processing') {
-          setStatusText('AI processing video frames...');
+          const pct = data.progress != null ? Math.round(data.progress) : 0;
+          const fr = data.frame || 0;
+          const tot = data.total_frames || 0;
+          setStatusText(tot > 0
+            ? `Processing... ${pct}% (${fr}/${tot} frames)`
+            : `AI processing video frames... ${pct}%`);
           return;
         }
 
@@ -254,13 +261,17 @@ const CricketTrajectoryPredictor: React.FC = () => {
         }
 
         if (data.status === 'done') {
+          const stats = data.summary?.ball_stats || {};
           setFramesProcessed(data.summary?.frames_processed || 0);
-          setBounceEvents(Array.isArray(data.summary?.bounce_events) ? data.summary.bounce_events.length : 0);
+          setBounceEvents(stats.total ?? (data.summary?.bounce_events?.length || 0));
+          setDotCount(stats.dots ?? 0);
+          setRunCount((stats.runs ?? 0) + (stats.boundaries ?? 0));
           setHitDetected(!!data.summary?.hit_detected);
           setDeletedBounces(0);
-          setVideoUrl(`http://localhost:5000${data.video_url}`);
-          setDownloadUrl(`http://localhost:5000${data.video_url}`);
-          setStatusText('Prediction complete! Trajectory overlay active.');
+          const ts = Date.now();
+          setVideoUrl(`http://localhost:5000${data.video_url}?t=${ts}`);
+          setDownloadUrl(`http://localhost:5000${data.video_url}?t=${ts}`);
+          setStatusText(`Done! ${stats.total ?? 0} balls — DOT: ${stats.dots ?? 0}, RUN: ${(stats.runs ?? 0) + (stats.boundaries ?? 0)}`);
           setIsProcessing(false);
           setIsProcessed(true);
         }
@@ -269,7 +280,7 @@ const CricketTrajectoryPredictor: React.FC = () => {
         setStatusText('Polling failed: ' + error.message);
         setIsProcessing(false);
       }
-    }, 2000);
+    }, 1000);
   };
 
   const handleDownload = async () => {
@@ -518,16 +529,20 @@ const CricketTrajectoryPredictor: React.FC = () => {
                   <span style={styles.statNumber}>{framesProcessed}</span>
                 </div>
                 <div style={styles.statItem}>
-                  <span style={styles.statLabel}>Bounce events detected</span>
+                  <span style={styles.statLabel}>Total balls tracked</span>
                   <span style={styles.statNumber}>{bounceEvents}</span>
                 </div>
                 <div style={styles.statItem}>
-                  <span style={styles.statLabel}>Shot Type</span>
-                  <span style={{ ...styles.statNumber, color: hitDetected ? '#38F0B0' : '#F03870' }}>{hitDetected ? 'HIT' : 'MISS / NO HIT'}</span>
+                  <span style={styles.statLabel}>DOT (not hit / no run)</span>
+                  <span style={{ ...styles.statNumber, color: '#50DC50' }}>{dotCount}</span>
                 </div>
                 <div style={styles.statItem}>
-                  <span style={styles.statLabel}>Deleted bounce events</span>
-                  <span style={{ ...styles.statNumber, ...styles.accentText }}>{deletedBounces}</span>
+                  <span style={styles.statLabel}>RUN (hit for runs)</span>
+                  <span style={{ ...styles.statNumber, color: '#5080FF' }}>{runCount}</span>
+                </div>
+                <div style={styles.statItem}>
+                  <span style={styles.statLabel}>Last shot</span>
+                  <span style={{ ...styles.statNumber, color: hitDetected ? '#38F0B0' : '#F03870' }}>{hitDetected ? 'HIT' : 'DOT / NO HIT'}</span>
                 </div>
                 <div style={styles.statItem}>
                   <span style={styles.statLabel}>Trajectory confidence</span>
@@ -554,10 +569,10 @@ const CricketTrajectoryPredictor: React.FC = () => {
               <div style={{ ...styles.statsPanel, ...styles.eventLogPanel }}>
                 <div style={styles.statsTitle}>EVENT LOG</div>
                 <div style={styles.eventLogMsg}>
-                  Processed {framesProcessed} frames. Deleted {deletedBounces} bounce events.
+                  {bounceEvents} ball{bounceEvents !== 1 ? 's' : ''} tracked — DOT: {dotCount}, RUN: {runCount}.
                 </div>
                 <div style={styles.aiNote}>
-                  AI predicted trajectory with mint confidence
+                  Pitch map zones & bounce dots drawn on the video result
                 </div>
               </div>
             </div>
