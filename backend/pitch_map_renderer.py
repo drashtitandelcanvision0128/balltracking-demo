@@ -30,6 +30,16 @@ PITCH_ZONES = [
 
 ZONE_NAMES = [z[4] for z in PITCH_ZONES]
 
+ZONE_SHORT_VIDEO = {
+    'FULL TOSS': 'FT',
+    'YORKER': 'YKR',
+    'HALF VOLLEY': 'H.VOL',
+    'FULL': 'FULL',
+    'LENGTH': 'LENGTH',
+    'BACK OF A LENGTH': 'B.O.A',
+    'SHORT': 'SHORT',
+}
+
 OUTCOME_COLORS_BGR = {
     'DOTS': (20, 20, 20),
     'RUNS': (255, 210, 0),
@@ -192,6 +202,25 @@ def map_point_to_video(px, py, H_inv):
     return int(t[0, 0, 0]), int(t[0, 0, 1])
 
 
+def video_to_pitchmap(vx, vy, H_matrix):
+    pt = np.array([[[float(vx), float(vy)]]], dtype=np.float32)
+    t = cv2.perspectiveTransform(pt, H_matrix)
+    return int(t[0, 0, 0]), int(t[0, 0, 1])
+
+
+def is_on_pitch(vx, vy, H_matrix, margin=8):
+    """True when a video pixel lies inside the pitch rectangle in map space."""
+    px, py = video_to_pitchmap(vx, vy, H_matrix)
+    return (PITCH_L - margin <= px <= PITCH_R + margin and
+            PITCH_TOP - margin <= py <= PITCH_BOT + margin)
+
+
+def _zone_height_video(H_inv, y1, y2):
+    _, yt = map_point_to_video(CENTER_X, y1, H_inv)
+    _, yb = map_point_to_video(CENTER_X, y2, H_inv)
+    return max(0, abs(yb - yt))
+
+
 _TEMPLATE_CACHE = {}
 
 
@@ -218,7 +247,7 @@ def _put_label_on_frame(frame, text, x, y, bg_bgr, font_scale=0.7):
 
 
 def draw_distance_markers_on_video(frame, H_inv):
-    """Distance markers — left edge only, single draw."""
+    """Distance markers — left of pitch, aligned with zone lines."""
     markers = [
         (PITCH_TOP + 12, 'STUMPS'),
         (Y_2M, '2M'),
@@ -229,28 +258,128 @@ def draw_distance_markers_on_video(frame, H_inv):
     ]
     h, w = frame.shape[:2]
     for my, label in markers:
-        lx, ly = map_point_to_video(PITCH_L + 20, my, H_inv)
-        if 0 <= lx < w - 30 and 0 <= ly < h - 5:
-            cv2.putText(frame, label, (lx, ly), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 0, 0), 2, cv2.LINE_AA)
-            cv2.putText(frame, label, (lx, ly), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255, 255, 255), 1, cv2.LINE_AA)
+        lx, ly = map_point_to_video(PITCH_L - 18, my, H_inv)
+        rx, ry = map_point_to_video(PITCH_L + 2, my, H_inv)
+        if not (0 <= ly < h - 5 and 0 <= lx < w - 10):
+            continue
+        cv2.line(frame, (lx, ly), (rx, ry), (255, 255, 255), 1, cv2.LINE_AA)
+        cv2.putText(frame, label, (max(4, lx - 52), ly + 4), cv2.FONT_HERSHEY_DUPLEX,
+                    0.38, (255, 255, 255), 2, cv2.LINE_AA)
+        cv2.putText(frame, label, (max(4, lx - 52), ly + 4), cv2.FONT_HERSHEY_DUPLEX,
+                    0.38, (0, 0, 0), 1, cv2.LINE_AA)
+
+
+def _put_black_text(frame, text, x, y, font_scale=0.5, thickness=2):
+    """Black label with thin white outline for readability on coloured zones."""
+    cv2.putText(frame, text, (x, y), cv2.FONT_HERSHEY_DUPLEX, font_scale, (255, 255, 255), thickness + 2, cv2.LINE_AA)
+    cv2.putText(frame, text, (x, y), cv2.FONT_HERSHEY_DUPLEX, font_scale, (0, 0, 0), thickness, cv2.LINE_AA)
+
+
+def draw_zone_boundary_lines_on_video(frame, H_inv):
+    """Horizontal zone dividers warped onto the live pitch."""
+    h, w = frame.shape[:2]
+    boundaries = [Y_YORKER, Y_2M, Y_4M, Y_6M, Y_8M, Y_HALFWAY]
+    for y in boundaries:
+        pts = []
+        for px in range(PITCH_L, PITCH_R + 1, 8):
+            vx, vy = map_point_to_video(px, y, H_inv)
+            if 0 <= vx < w and 0 <= vy < h:
+                pts.append((vx, vy))
+        if len(pts) >= 2:
+            for i in range(len(pts) - 1):
+                cv2.line(frame, pts[i], pts[i + 1], (255, 255, 255), 2, cv2.LINE_AA)
+    # centre line
+    cl_pts = []
+    for py in range(PITCH_TOP, PITCH_BOT + 1, 12):
+        vx, vy = map_point_to_video(CENTER_X, py, H_inv)
+        if 0 <= vx < w and 0 <= vy < h:
+            cl_pts.append((vx, vy))
+    for i in range(len(cl_pts) - 1):
+        cv2.line(frame, cl_pts[i], cl_pts[i + 1], (200, 120, 60), 2, cv2.LINE_AA)
+
+
+def draw_colored_zones_on_video(frame, H_inv, alpha=0.62):
+    """Fill each length band on the live pitch with its zone colour (vivid, per-band)."""
+    h, w = frame.shape[:2]
+    blended = frame.astype(np.float32)
+    for y1, y2, col, _, _ in PITCH_ZONES:
+        corners = np.array(
+            [[PITCH_L, y1], [PITCH_R, y1], [PITCH_R, y2], [PITCH_L, y2]],
+            dtype=np.float32,
+        ).reshape(1, 4, 2)
+        pts = cv2.perspectiveTransform(corners, H_inv)[0].astype(np.int32)
+        zone_layer = np.zeros_like(frame)
+        cv2.fillConvexPoly(zone_layer, pts, col)
+        mask = np.zeros((h, w), dtype=np.uint8)
+        cv2.fillConvexPoly(mask, pts, 255)
+        m = (mask.astype(np.float32) / 255.0)[:, :, np.newaxis]
+        blended = blended * (1.0 - m * alpha) + zone_layer.astype(np.float32) * (m * alpha)
+    frame[:] = blended.astype(np.uint8)
+
+
+def precompute_pitch_zone_layers(h, w, H_inv):
+    """Precompute zone colours + mask once per video for fast per-frame compositing."""
+    color = np.zeros((h, w, 3), dtype=np.uint8)
+    mask = np.zeros((h, w), dtype=np.uint8)
+    for y1, y2, col, _, _ in PITCH_ZONES:
+        corners = np.array(
+            [[PITCH_L, y1], [PITCH_R, y1], [PITCH_R, y2], [PITCH_L, y2]],
+            dtype=np.float32,
+        ).reshape(1, 4, 2)
+        pts = cv2.perspectiveTransform(corners, H_inv)[0].astype(np.int32)
+        cv2.fillConvexPoly(color, pts, col)
+        cv2.fillConvexPoly(mask, pts, 255)
+    return color, mask
+
+
+def composite_pitch_zones(frame, zone_color, zone_mask, alpha=0.55):
+    """Blend precomputed zone layers onto a video frame."""
+    m = (zone_mask.astype(np.float32) / 255.0)[:, :, np.newaxis]
+    blended = frame.astype(np.float32) * (1.0 - m * alpha) + zone_color.astype(np.float32) * (m * alpha)
+    frame[:] = blended.astype(np.uint8)
+
+
+def build_pitch_annotation_layer(h, w, H_inv):
+    """Static lines + labels layer (computed once per video)."""
+    layer = np.zeros((h, w, 3), dtype=np.uint8)
+    draw_zone_boundary_lines_on_video(layer, H_inv)
+    draw_distance_markers_on_video(layer, H_inv)
+    draw_zone_labels_on_video(layer, H_inv)
+    return layer
 
 
 def draw_zone_labels_on_video(frame, H_inv, bounces=None):
-    """Zone names — right edge only, one label per zone (no duplicates)."""
+    """Zone names centred in each band — skip tiny zones to avoid overlap."""
     h, w = frame.shape[:2]
     for y1, y2, col, _, label in PITCH_ZONES:
+        zone_h = _zone_height_video(H_inv, y1, y2)
+        if zone_h < 22:
+            continue
         mid_y = (y1 + y2) // 2
-        short = label.replace('BACK OF A ', 'B.O.A ')
-        rx, ry = map_point_to_video(PITCH_R - 5, mid_y, H_inv)
-        if 0 <= rx < w - 10 and 0 <= ry < h - 5:
-            cv2.putText(frame, short, (rx + 6, ry + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.36, (0, 0, 0), 2, cv2.LINE_AA)
-            cv2.putText(frame, short, (rx + 6, ry + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.36, (255, 255, 255), 1, cv2.LINE_AA)
+        if zone_h < 38:
+            short = ZONE_SHORT_VIDEO.get(label, label[:6])
+        else:
+            short = label.replace('BACK OF A ', 'B.O.A ')
+        cx, cy = map_point_to_video(CENTER_X, mid_y, H_inv)
+        if not (0 <= cx < w - 10 and 0 <= cy < h - 5):
+            continue
+        font_scale = max(0.30, min(0.50, zone_h / 32.0))
+        thickness = 1
+        (tw, th), _ = cv2.getTextSize(short, cv2.FONT_HERSHEY_DUPLEX, font_scale, thickness)
+        tx, ty = cx - tw // 2, cy + th // 2
+        _put_black_text(frame, short, tx, ty, font_scale=font_scale, thickness=thickness)
 
 
 def create_full_pitch_overlay(bounces=None):
-    """Colour zones only — all text drawn once on video after warp."""
+    """Coloured zone bands (same palette as inset panel) — text drawn on video after warp."""
     img = np.zeros((MAP_H, MAP_W, 3), dtype=np.uint8)
-    _draw_pitch_zones(img, light=True)
+    # saturated zone colours — same as inset pitch map
+    _draw_pitch_zones(img, light=False)
+    # zone divider lines included in warp so they follow pitch perspective
+    for y in (Y_YORKER, Y_2M, Y_4M, Y_6M, Y_8M, Y_HALFWAY):
+        cv2.line(img, (PITCH_L, y), (PITCH_R, y), (255, 255, 255), 2, cv2.LINE_AA)
+    cv2.line(img, (CENTER_X, PITCH_TOP), (CENTER_X, PITCH_BOT), (200, 120, 60), 2, cv2.LINE_AA)
+    cv2.rectangle(img, (PITCH_L, PITCH_TOP), (PITCH_R, PITCH_BOT), (255, 255, 255), 2)
     mask = np.zeros((MAP_H, MAP_W), dtype=np.uint8)
     cv2.rectangle(mask, (PITCH_L, PITCH_TOP), (PITCH_R, PITCH_BOT), 255, -1)
     return img, mask
@@ -260,7 +389,7 @@ def create_light_pitch_overlay():
     return create_full_pitch_overlay(bounces=None)
 
 
-def warp_pitch_overlay(frame, overlay, mask, H_inv, alpha=0.32):
+def warp_pitch_overlay(frame, overlay, mask, H_inv, alpha=0.44):
     h, w = frame.shape[:2]
     warped = cv2.warpPerspective(overlay, H_inv, (w, h))
     warped_mask = cv2.warpPerspective(mask, H_inv, (w, h)).astype(np.float32) / 255.0
@@ -269,19 +398,75 @@ def warp_pitch_overlay(frame, overlay, mask, H_inv, alpha=0.32):
     return out.astype(np.uint8)
 
 
-def draw_light_bounce_dots(frame, bounces, use_video_coords=True):
-    """Bounce markers on pitch — green=DOT, red=RUN, text beside dot."""
+def draw_live_ball_track(frame, coords, trail_pts=None, is_predicted=False):
+    """Live ball position + short motion trail (visible during delivery)."""
+    h, w = frame.shape[:2]
+    if trail_pts and len(trail_pts) >= 2:
+        pts = [(int(p[0]), int(p[1])) for p in trail_pts[-16:]]
+        for i in range(1, len(pts)):
+            if 0 <= pts[i][0] < w and 0 <= pts[i][1] < h:
+                cv2.line(frame, pts[i - 1], pts[i], (0, 220, 255), 2, cv2.LINE_AA)
+    if coords is None:
+        return
+    cx, cy = int(coords[0]), int(coords[1])
+    if not (0 <= cx < w and 0 <= cy < h):
+        return
+    ball_col = (0, 220, 255) if not is_predicted else (0, 160, 255)
+    cv2.circle(frame, (cx, cy), 11, ball_col, -1, cv2.LINE_AA)
+    cv2.circle(frame, (cx, cy), 11, (255, 255, 255), 2, cv2.LINE_AA)
+
+
+def _draw_delivery_info_card(frame, cx, cy, length, label, dot_color):
+    """Small info card next to bounce dot: length zone and outcome."""
+    tag_map = {'DOTS': 'DOT', 'RUNS': 'RUN', 'BOUNDARIES': '4', 'WICKETS': 'OUT'}
+    short_len = ZONE_SHORT_VIDEO.get(length, (length or '')[:8].upper())
+    tag = tag_map.get(label, 'DOT')
+    lines = [ln for ln in (short_len, tag) if ln]
+
+    fs, th = 0.40, 1
+    pad_x, pad_y, line_h = 6, 4, 13
+    tw_max = 0
+    for ln in lines:
+        (tw, _), _ = cv2.getTextSize(ln, cv2.FONT_HERSHEY_DUPLEX, fs, th)
+        tw_max = max(tw_max, tw)
+
+    card_w = tw_max + pad_x * 2
+    card_h = len(lines) * line_h + pad_y * 2
+    h, w = frame.shape[:2]
+
+    x1 = cx + 18
+    y1 = cy - card_h // 2
+    if x1 + card_w > w - 6:
+        x1 = cx - 18 - card_w
+    y1 = max(6, min(y1, h - card_h - 6))
+    x2, y2 = x1 + card_w, y1 + card_h
+
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (x1, y1), (x2, y2), (15, 15, 15), -1)
+    cv2.addWeighted(overlay, 0.82, frame, 0.18, 0, frame)
+    cv2.rectangle(frame, (x1, y1), (x2, y2), dot_color, 2, cv2.LINE_AA)
+
+    for i, ln in enumerate(lines):
+        ty = y1 + pad_y + (i + 1) * line_h - 3
+        cv2.putText(frame, ln, (x1 + pad_x, ty), cv2.FONT_HERSHEY_DUPLEX,
+                    fs, (255, 255, 255), th, cv2.LINE_AA)
+
+
+def draw_light_bounce_dots(frame, bounces, use_video_coords=True, H_matrix=None, show_labels=False):
+    """Bounce markers on pitch — dots only; labels shown in UI sidebar."""
+    h, w = frame.shape[:2]
     for bounce in bounces:
         coords = bounce['coords'] if use_video_coords else bounce.get('map_coords', bounce['coords'])
         label = bounce.get('label') or bounce.get('type', 'DOTS')
-        color = LIGHT_OUTCOME_BGR.get(label, LIGHT_OUTCOME_BGR['DOTS'])
+        length = bounce.get('length', '')
         cx, cy = int(coords[0]), int(coords[1])
-        cv2.circle(frame, (cx, cy), 14, color, -1, cv2.LINE_AA)
-        cv2.circle(frame, (cx, cy), 14, (255, 255, 255), 2, cv2.LINE_AA)
-        run_txt = {'DOTS': 'DOT', 'RUNS': 'RUN', 'BOUNDARIES': '4', 'WICKETS': 'OUT'}.get(label, 'DOT')
-        tx, ty = cx + 18, cy + 5
-        cv2.putText(frame, run_txt, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 0, 0), 3, cv2.LINE_AA)
-        cv2.putText(frame, run_txt, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 1, cv2.LINE_AA)
+        if not (0 <= cx < w and 0 <= cy < h):
+            continue
+        color = LIGHT_OUTCOME_BGR.get(label, LIGHT_OUTCOME_BGR['DOTS'])
+        cv2.circle(frame, (cx, cy), 10, color, -1, cv2.LINE_AA)
+        cv2.circle(frame, (cx, cy), 10, (255, 255, 255), 2, cv2.LINE_AA)
+        if show_labels:
+            _draw_delivery_info_card(frame, cx, cy, length, label, color)
 
 
 def create_hawkeye_template(bowler_name='PITCH MAP'):
@@ -315,26 +500,30 @@ def render_pitch_map(bounces, bowler_name='PITCH MAP', base_img=None):
     for ball in bounces:
         bx, by = ball['coords']
         b_type = ball.get('type', 'DOTS')
-        length = ball.get('length') or classify_length_zone(by)
         color = OUTCOME_COLORS_BGR.get(b_type, OUTCOME_COLORS_BGR['DOTS'])
         bx = int(max(PITCH_L + 8, min(PITCH_R - 8, bx)))
         by = int(max(PITCH_TOP + 8, min(PITCH_BOT - 8, by)))
         cv2.circle(img, (bx, by), 9, color, -1, cv2.LINE_AA)
         cv2.circle(img, (bx, by), 9, (30, 30, 30), 1, cv2.LINE_AA)
-        # tiny length tag near dot
-        short_len = length.split()[0][:4]
-        cv2.putText(img, short_len, (bx + 10, by + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.28, (255, 255, 255), 1, cv2.LINE_AA)
 
     return img
 
 
 def auto_pitch_quad(width, height):
+    """Map pitch template onto video — aligned with stumps on the ground plane."""
     cx = width * 0.5
+    portrait = height > width * 1.15
+    if portrait:
+        top_y, bot_y = height * 0.53, height * 0.95
+        top_hw, bot_hw = width * 0.09, width * 0.29
+    else:
+        top_y, bot_y = height * 0.46, height * 0.90
+        top_hw, bot_hw = width * 0.09, width * 0.26
     return np.array([
-        [cx - width * 0.10, height * 0.38],
-        [cx + width * 0.10, height * 0.38],
-        [cx - width * 0.26, height * 0.90],
-        [cx + width * 0.26, height * 0.90],
+        [cx - top_hw, top_y],
+        [cx + top_hw, top_y],
+        [cx - bot_hw, bot_y],
+        [cx + bot_hw, bot_y],
     ], dtype=np.float32)
 
 
