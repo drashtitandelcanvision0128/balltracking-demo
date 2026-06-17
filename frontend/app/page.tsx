@@ -9,6 +9,29 @@ interface Player {
   style: string;
 }
 
+interface DeliveryEvent {
+  length?: string;
+  type?: string;
+  frame?: number;
+}
+
+const OUTCOME_LABEL: Record<string, string> = {
+  DOTS: 'DOT',
+  RUNS: 'RUN',
+  BOUNDARIES: '4',
+  WICKETS: 'OUT',
+};
+
+const LENGTH_LABEL: Record<string, string> = {
+  'FULL TOSS': 'Full Toss',
+  YORKER: 'Yorker',
+  'HALF VOLLEY': 'Half Volley',
+  FULL: 'Full',
+  LENGTH: 'Length',
+  'BACK OF A LENGTH': 'Back of Length',
+  SHORT: 'Short',
+};
+
 const CricketTrajectoryPredictor: React.FC = () => {
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [fileName, setFileName] = useState<string>('video.mp4');
@@ -18,8 +41,11 @@ const CricketTrajectoryPredictor: React.FC = () => {
   const [videoUrl, setVideoUrl] = useState<string>('');
   const [downloadUrl, setDownloadUrl] = useState<string>('');
   const [framesProcessed, setFramesProcessed] = useState<number>(843);
-  const [bounceEvents, setBounceEvents] = useState<number>(78);
-  const [deletedBounces, setDeletedBounces] = useState<number>(78);
+  const [bounceEvents, setBounceEvents] = useState<number>(0);
+  const [dotCount, setDotCount] = useState<number>(0);
+  const [runCount, setRunCount] = useState<number>(0);
+  const [deliveries, setDeliveries] = useState<DeliveryEvent[]>([]);
+  const [deletedBounces, setDeletedBounces] = useState<number>(0);
   const [hitDetected, setHitDetected] = useState<boolean>(false);
   const [videoDuration, setVideoDuration] = useState<number>(0);
   const [currentTime, setCurrentTime] = useState<number>(0);
@@ -112,6 +138,7 @@ const CricketTrajectoryPredictor: React.FC = () => {
       setFileName(file.name);
       setStatusText(`Selected: ${file.name}. Click 'Start Prediction'.`);
       setIsProcessed(false);
+      setDeliveries([]);
       // Reset stats to default
       setFramesProcessed(843);
       setBounceEvents(78);
@@ -241,7 +268,12 @@ const CricketTrajectoryPredictor: React.FC = () => {
         }
 
         if (data.status === 'processing') {
-          setStatusText('AI processing video frames...');
+          const pct = data.progress != null ? Math.round(data.progress) : 0;
+          const fr = data.frame || 0;
+          const tot = data.total_frames || 0;
+          setStatusText(tot > 0
+            ? `Processing... ${pct}% (${fr}/${tot} frames)`
+            : `AI processing video frames... ${pct}%`);
           return;
         }
 
@@ -254,13 +286,18 @@ const CricketTrajectoryPredictor: React.FC = () => {
         }
 
         if (data.status === 'done') {
+          const stats = data.summary?.ball_stats || {};
           setFramesProcessed(data.summary?.frames_processed || 0);
-          setBounceEvents(Array.isArray(data.summary?.bounce_events) ? data.summary.bounce_events.length : 0);
+          setBounceEvents(stats.total ?? (data.summary?.bounce_events?.length || 0));
+          setDotCount(stats.dots ?? 0);
+          setRunCount((stats.runs ?? 0) + (stats.boundaries ?? 0));
+          setDeliveries(data.summary?.bounce_events || []);
           setHitDetected(!!data.summary?.hit_detected);
           setDeletedBounces(0);
-          setVideoUrl(`http://localhost:5000${data.video_url}`);
-          setDownloadUrl(`http://localhost:5000${data.video_url}`);
-          setStatusText('Prediction complete! Trajectory overlay active.');
+          const ts = Date.now();
+          setVideoUrl(`http://localhost:5000${data.video_url}?t=${ts}`);
+          setDownloadUrl(`http://localhost:5000${data.video_url}?t=${ts}`);
+          setStatusText(`Done! ${stats.total ?? 0} balls — DOT: ${stats.dots ?? 0}, RUN: ${(stats.runs ?? 0) + (stats.boundaries ?? 0)}`);
           setIsProcessing(false);
           setIsProcessed(true);
         }
@@ -269,7 +306,7 @@ const CricketTrajectoryPredictor: React.FC = () => {
         setStatusText('Polling failed: ' + error.message);
         setIsProcessing(false);
       }
-    }, 2000);
+    }, 1000);
   };
 
   const handleDownload = async () => {
@@ -518,21 +555,48 @@ const CricketTrajectoryPredictor: React.FC = () => {
                   <span style={styles.statNumber}>{framesProcessed}</span>
                 </div>
                 <div style={styles.statItem}>
-                  <span style={styles.statLabel}>Bounce events detected</span>
+                  <span style={styles.statLabel}>Total balls tracked</span>
                   <span style={styles.statNumber}>{bounceEvents}</span>
                 </div>
                 <div style={styles.statItem}>
-                  <span style={styles.statLabel}>Shot Type</span>
-                  <span style={{ ...styles.statNumber, color: hitDetected ? '#38F0B0' : '#F03870' }}>{hitDetected ? 'HIT' : 'MISS / NO HIT'}</span>
+                  <span style={styles.statLabel}>DOT (not hit / no run)</span>
+                  <span style={{ ...styles.statNumber, color: '#50DC50' }}>{dotCount}</span>
                 </div>
                 <div style={styles.statItem}>
-                  <span style={styles.statLabel}>Deleted bounce events</span>
-                  <span style={{ ...styles.statNumber, ...styles.accentText }}>{deletedBounces}</span>
+                  <span style={styles.statLabel}>RUN (hit for runs)</span>
+                  <span style={{ ...styles.statNumber, color: '#5080FF' }}>{runCount}</span>
+                </div>
+                <div style={styles.statItem}>
+                  <span style={styles.statLabel}>Last shot</span>
+                  <span style={{ ...styles.statNumber, color: hitDetected ? '#38F0B0' : '#F03870' }}>{hitDetected ? 'HIT' : 'DOT / NO HIT'}</span>
                 </div>
                 <div style={styles.statItem}>
                   <span style={styles.statLabel}>Trajectory confidence</span>
                   <span style={styles.statNumber}>97.3%</span>
                 </div>
+
+                {deliveries.length > 0 && (
+                  <div style={styles.deliveryLogSection}>
+                    <div style={styles.deliveryLogTitle}>DELIVERY LOG</div>
+                    <div style={styles.deliveryLogList}>
+                      {deliveries.map((d, i) => {
+                        const lengthKey = d.length || '';
+                        const lengthText = LENGTH_LABEL[lengthKey] || lengthKey || '—';
+                        const outcome = OUTCOME_LABEL[d.type || 'DOTS'] || 'DOT';
+                        const outcomeColor =
+                          d.type === 'RUNS' || d.type === 'BOUNDARIES' ? '#5080FF'
+                          : d.type === 'WICKETS' ? '#F03870' : '#50DC50';
+                        return (
+                          <div key={`${d.frame ?? i}-${i}`} style={styles.deliveryRow}>
+                            <span style={styles.deliveryNum}>#{i + 1}</span>
+                            <span style={styles.deliveryLength}>{lengthText}</span>
+                            <span style={{ ...styles.deliveryOutcome, color: outcomeColor }}>{outcome}</span>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                )}
               </div>
 
               <div style={styles.statsPanel}>
@@ -554,10 +618,10 @@ const CricketTrajectoryPredictor: React.FC = () => {
               <div style={{ ...styles.statsPanel, ...styles.eventLogPanel }}>
                 <div style={styles.statsTitle}>EVENT LOG</div>
                 <div style={styles.eventLogMsg}>
-                  Processed {framesProcessed} frames. Deleted {deletedBounces} bounce events.
+                  {bounceEvents} ball{bounceEvents !== 1 ? 's' : ''} tracked — DOT: {dotCount}, RUN: {runCount}.
                 </div>
                 <div style={styles.aiNote}>
-                  AI predicted trajectory with mint confidence
+                  Pitch zones on video; delivery details listed in Frame Analysis
                 </div>
               </div>
             </div>
@@ -1011,6 +1075,52 @@ const styles: { [key: string]: React.CSSProperties } = {
     background: '#10231F',
     padding: '0.2rem 0.7rem',
     borderRadius: 20,
+    fontFamily: 'monospace',
+  },
+  deliveryLogSection: {
+    marginTop: '1rem',
+    paddingTop: '0.8rem',
+    borderTop: '1px solid rgba(65, 210, 140, 0.35)',
+  },
+  deliveryLogTitle: {
+    fontWeight: 800,
+    fontSize: '0.75rem',
+    textTransform: 'uppercase',
+    color: '#48E0A8',
+    marginBottom: '0.6rem',
+    letterSpacing: 0.8,
+  },
+  deliveryLogList: {
+    maxHeight: 220,
+    overflowY: 'auto',
+    display: 'flex',
+    flexDirection: 'column',
+    gap: 6,
+    paddingRight: 4,
+  },
+  deliveryRow: {
+    display: 'grid',
+    gridTemplateColumns: '36px 1fr 48px',
+    alignItems: 'center',
+    gap: 8,
+    background: '#071212',
+    borderRadius: 8,
+    padding: '6px 10px',
+    border: '1px solid rgba(60, 210, 140, 0.2)',
+    fontSize: '0.78rem',
+  },
+  deliveryNum: {
+    color: '#87B7A5',
+    fontWeight: 700,
+    fontFamily: 'monospace',
+  },
+  deliveryLength: {
+    color: '#EEF5F0',
+    fontWeight: 600,
+  },
+  deliveryOutcome: {
+    fontWeight: 800,
+    textAlign: 'right',
     fontFamily: 'monospace',
   },
   accentText: {

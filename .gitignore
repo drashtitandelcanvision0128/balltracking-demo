@@ -1,5 +1,6 @@
 cricket_ball_data
 myenv
+.venv/
 uploads/
 backend/uploads/
 *.mp4
