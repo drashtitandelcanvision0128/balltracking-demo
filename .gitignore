@@ -12,3 +12,21 @@ __pycache__/
 *.pyc
 *.log
 backend/__pycache__/predict_server.cpython-314.pyc
+
+# Build cache
+frontend/.next/
+
+# YOLO pretrained checkpoints (Ultralytics auto-downloads when training)
+backend/yolov8n.pt
+backend/yolov8s.pt
+backend/yolov8m.pt
+backend/yolov8l.pt
+
+# build caches
+frontend/.next/
+
+# pretrained YOLO checkpoints (Ultralytics auto-downloads when training)
+backend/yolov8n.pt
+backend/yolov8s.pt
+backend/yolov8m.pt
+backend/yolov8l.pt
