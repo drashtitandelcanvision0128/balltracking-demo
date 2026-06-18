@@ -1,27 +1,100 @@
 model:
-  confidence: 0.15
-  image_size: 480
+  confidence: 0.10
+  image_size: 1280
   path: runs/detect/train5/weights/best.pt
+  tracker: bytetrack
 physics:
   hit_angle_threshold: 35
   speed_range:
-  - 50
-  - 95
+  - 80
+  - 180
   spin_multiplier: 0.4
   swing_multiplier: 0.2
+bowling_speed:
+  global_min_kmh: 70
+  global_max_kmh: 180
+  tiers:
+  - id: medium
+    label: Medium Pace
+    avg_min: 80
+    avg_max: 120
+    max_speed: 140
+  - id: fast_medium
+    label: Fast Medium
+    avg_min: 120
+    avg_max: 150
+    max_speed: 160
+  - id: fast
+    label: Fast Bowling
+    avg_min: 130
+    avg_max: 160
+    max_speed: 180
 processing:
   ffmpeg_path: ffmpeg
   max_file_size_mb: 500
+  clip_by_clip: false
+  clip_mode: stream
+  stream_detect_every_frame: true
+  clip_scan_stride: 2
+  clip_start_padding: 15
+  clip_end_padding: 50
+  clip_lost_sec: 1.15
+  clip_scan_conf: 0.10
+  clip_deep_imgsz: 1280
   supported_formats:
   - .mp4
   - .avi
   - .mov
+  - .mkv
+  - .webm
+  - .m4v
 tracking:
   lost_threshold: 5
   max_queue_size: 120
   max_skip_frames: 10
-  stride: 2
+  stride: 1
+  coast_seconds: 0.45
+pitch:
+  length_m: 20.12
+  width_m: 3.05
+  stump_width_m: 0.2286
+  calibration_samples: 30
+  prefer_manual_calibration: true
 visualization:
   show_heatmap: true
-  show_predictions: true
-  trail_length: 30
+  show_predictions: false
+  trail_length: 0
+  show_trajectory_lines: false
+  show_corner_pitch_map: false
+  show_summary_pitch_map: false
+  show_pitch_zone_overlay: true
+database:
+  url: sqlite:///cricket_analytics.db
+redis:
+  url: redis://localhost:6379/0
+gpu:
+  require_cuda: true
+  device_id: 0
+  half_precision: true
+  cudnn_benchmark: true
+  allow_tf32: true
+  fuse_layers: true
+  memory_fraction: 0.85
+  warmup_imgsz: 640
+  waiting_imgsz: 640
+  waiting_max_dim: 640
+  waiting_stride: 2
+  active_imgsz: 1280
+  active_max_dim: 1280
+  nvenc: true
+  enable_pose: true
+  calibration_samples: 30
+  summary_seconds: 1
+delivery_filter:
+  min_track_frames: 3
+  min_track_frames_strict: 5
+  min_y_travel_ratio: 0.028
+  min_delivery_gap_sec: 0.40
+  min_new_detection_conf: 0.12
+  absurd_speed_kmh: 350
+  min_frames_between_markers: 10

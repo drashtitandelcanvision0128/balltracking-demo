@@ -23,6 +23,6 @@ Write-Host "Verifying GPU ..."
 & $python -c "import torch; print('torch', torch.__version__); print('cuda', torch.cuda.is_available()); print('gpu', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU only')"
 
 Write-Host ""
-Write-Host "Done. Start backend with:"
+Write-Host "Done. Start GPU backend with:"
 Write-Host "  cd backend"
-Write-Host "  ..\.venv\Scripts\python.exe predict_server.py"
+Write-Host "  .\run_gpu.ps1"
