@@ -1,6 +1,7 @@
 cricket_ball_data
 backend/dataset/cricket_ball_data/
 backend/dataset/_kaggle_download/
+backend/dataset/hard_negatives/
 myenv
 .venv/
 uploads/
