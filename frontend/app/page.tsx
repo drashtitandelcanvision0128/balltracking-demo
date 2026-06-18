@@ -1,6 +1,10 @@
 "use client";
 import React, { useState, useRef, useCallback, useEffect } from 'react';
 import Link from 'next/link';
+import AnalyticsPanel from '../components/AnalyticsPanel';
+import PitchMapCanvas from '../components/PitchMapCanvas';
+import PitchCalibration, { type PitchPoint } from '../components/PitchCalibration';
+import { API_BASE, buildVideoUrl, buildReportPdfUrl, type Analytics, type BounceEvent, type DeliveryClip } from '../lib/api';
 
 interface Player {
   id: string;
@@ -9,7 +13,7 @@ interface Player {
   style: string;
 }
 
-interface DeliveryEvent {
+interface DeliveryEvent extends BounceEvent {
   length?: string;
   type?: string;
   frame?: number;
@@ -45,15 +49,26 @@ const CricketTrajectoryPredictor: React.FC = () => {
   const [dotCount, setDotCount] = useState<number>(0);
   const [runCount, setRunCount] = useState<number>(0);
   const [deliveries, setDeliveries] = useState<DeliveryEvent[]>([]);
-  const [deletedBounces, setDeletedBounces] = useState<number>(0);
+  const [clips, setClips] = useState<DeliveryClip[]>([]);
+  const [analytics, setAnalytics] = useState<Analytics | null>(null);
+  const [avgSpeed, setAvgSpeed] = useState<number>(0);
+  const [maxSpeed, setMaxSpeed] = useState<number>(0);
+  const [paceLabel, setPaceLabel] = useState<string>('');
+  const [avgConfidence, setAvgConfidence] = useState<number>(0);
   const [hitDetected, setHitDetected] = useState<boolean>(false);
   const [videoDuration, setVideoDuration] = useState<number>(0);
   const [currentTime, setCurrentTime] = useState<number>(0);
+  const [videoFps, setVideoFps] = useState<number>(25);
+  const [reportPdfUrl, setReportPdfUrl] = useState<string>('');
+  const [activeJobId, setActiveJobId] = useState<string>('');
+  const [processingMode, setProcessingMode] = useState<string>('');
+  const [activeClipIndex, setActiveClipIndex] = useState<number | null>(null);
   const [isDragging, setIsDragging] = useState<boolean>(false);
   const [isLoggedIn, setIsLoggedIn] = useState<boolean>(false);
   const [hasMounted, setHasMounted] = useState<boolean>(false);
   const [showDropdown, setShowDropdown] = useState<boolean>(false);
   const [selectedPlayer, setSelectedPlayer] = useState<Player | null>(null);
+  const [pitchCalibration, setPitchCalibration] = useState<PitchPoint[] | null>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const dropdownRef = useRef<HTMLDivElement>(null);
@@ -139,10 +154,12 @@ const CricketTrajectoryPredictor: React.FC = () => {
       setStatusText(`Selected: ${file.name}. Click 'Start Prediction'.`);
       setIsProcessed(false);
       setDeliveries([]);
-      // Reset stats to default
-      setFramesProcessed(843);
-      setBounceEvents(78);
-      setDeletedBounces(78);
+      setClips([]);
+      setAnalytics(null);
+      setReportPdfUrl('');
+      setActiveJobId('');
+      setProcessingMode('');
+      setPitchCalibration(null);
       // Clear previous video URL
       if (videoUrl && videoUrl.startsWith('blob:')) {
         URL.revokeObjectURL(videoUrl);
@@ -175,10 +192,14 @@ const CricketTrajectoryPredictor: React.FC = () => {
     e.preventDefault();
     setIsDragging(false);
     const file = e.dataTransfer.files?.[0];
-    if (file && file.type.startsWith('video/')) {
+    const isVideo = file && (
+      file.type.startsWith('video/') ||
+      /\.(mp4|avi|mov|mkv|webm|m4v)$/i.test(file.name)
+    );
+    if (isVideo && file) {
       processSelectedFile(file);
     } else {
-      setStatusText('Please drop a valid video file.');
+      setStatusText('Please drop a valid video file (mp4, avi, mov, mkv, webm).');
     }
   }, [videoUrl]);
 
@@ -191,6 +212,62 @@ const CricketTrajectoryPredictor: React.FC = () => {
   const handleLoadedMetadata = () => {
     if (videoRef.current) {
       setVideoDuration(videoRef.current.duration);
+    }
+  };
+
+  const seekToFrame = (frame: number) => {
+    if (!videoRef.current || !frame) return;
+    const fps = videoFps > 0 ? videoFps : 25;
+    videoRef.current.currentTime = Math.max(0, frame / fps);
+    videoRef.current.play().catch(() => {});
+  };
+
+  const seekToClip = (clip: DeliveryClip) => {
+    setActiveClipIndex(clip.index);
+    seekToFrame(clip.release_frame || clip.start);
+  };
+
+  const applyJobSummary = (summary: Record<string, unknown> | undefined, jobId?: string) => {
+    const stats = (summary?.ball_stats || {}) as Record<string, number>;
+    const events: DeliveryEvent[] = (summary?.bounce_events as DeliveryEvent[]) || [];
+    const clipList: DeliveryClip[] = (summary?.clips as DeliveryClip[]) || [];
+    setFramesProcessed((summary?.frames_processed as number) || 0);
+    setBounceEvents(stats.total ?? events.length);
+    setDotCount(stats.dots ?? 0);
+    setRunCount((stats.runs ?? 0) + (stats.boundaries ?? 0));
+    setDeliveries(events);
+    setClips(clipList);
+    setHitDetected(!!summary?.hit_detected);
+    setVideoFps((summary?.fps as number) || 25);
+    setProcessingMode((summary?.processing_mode as string) || 'clip-by-clip');
+    if (jobId) setActiveJobId(jobId);
+
+    const speedStats = summary?.speed_stats as Record<string, unknown> | undefined;
+    const analyticsData = summary?.analytics as Analytics | undefined;
+    if (analyticsData) setAnalytics(analyticsData);
+    if (speedStats) {
+      setAvgSpeed((speedStats.avg_speed_kmh as number) || 0);
+      setMaxSpeed((speedStats.max_speed_kmh as number) || 0);
+      setPaceLabel((speedStats.pace_label as string) || '');
+    }
+    if (analyticsData && !speedStats?.avg_speed_kmh) {
+      setAvgSpeed(analyticsData.avg_speed_kmh || 0);
+      setMaxSpeed(analyticsData.max_speed_kmh || 0);
+      setPaceLabel(analyticsData.pace_label || '');
+    }
+    const speeds = events.map((e) => e.speed_kmh || 0).filter((s) => s > 0);
+    if (speeds.length && !speedStats?.avg_speed_kmh && !analyticsData?.avg_speed_kmh) {
+      setAvgSpeed(Math.round(speeds.reduce((a, b) => a + b, 0) / speeds.length));
+      setMaxSpeed(Math.round(Math.max(...speeds)));
+    }
+    const confs = events.map((e) => e.bounce_confidence || 0).filter((c) => c > 0);
+    setAvgConfidence(confs.length ? (confs.reduce((a, b) => a + b, 0) / confs.length) * 100 : 0);
+
+    const pdfUrl = summary?.report_pdf_url as string | undefined;
+    if (pdfUrl) {
+      setReportPdfUrl(buildReportPdfUrl(pdfUrl));
+    } else if (jobId) {
+      setReportPdfUrl(buildReportPdfUrl(`/report/${jobId}.pdf`));
     }
   };
 
@@ -209,12 +286,17 @@ const CricketTrajectoryPredictor: React.FC = () => {
     }
     setVideoUrl('');
     setDownloadUrl('');
+    setReportPdfUrl('');
+    setClips([]);
 
     const formData = new FormData();
     formData.append('video', selectedFile);
+    if (pitchCalibration && pitchCalibration.length === 4) {
+      formData.append('pitch_calibration', JSON.stringify(pitchCalibration));
+    }
 
     try {
-      const response = await fetch('http://localhost:5000/predict', {
+      const response = await fetch(`${API_BASE}/predict`, {
         method: 'POST',
         body: formData
       });
@@ -231,7 +313,8 @@ const CricketTrajectoryPredictor: React.FC = () => {
         if (selectedPlayer) {
           localStorage.setItem(`active_job_${selectedPlayer.id}`, data.job_id);
         }
-        setStatusText('Video queued. Waiting for processing...');
+        setActiveJobId(data.job_id);
+        setStatusText(`Video queued. Position: ${data.queue_position || 1}`);
         pollJob(data.job_id);
       }
     } catch (error: any) {
@@ -245,7 +328,7 @@ const CricketTrajectoryPredictor: React.FC = () => {
 
     pollIntervalRef.current = setInterval(async () => {
       try {
-        const response = await fetch(`http://localhost:5000/status/${jobId}`);
+        const response = await fetch(`${API_BASE}/status/${jobId}`);
         const data = await response.json();
 
         if (!response.ok || data.error) {
@@ -263,7 +346,7 @@ const CricketTrajectoryPredictor: React.FC = () => {
         }
 
         if (data.status === 'queued') {
-          setStatusText(`Video in queue... (Position: ${data.queue_position || 1})`);
+          setStatusText(`Video in queue... Position: ${data.queue_position || 1}`);
           return;
         }
 
@@ -271,9 +354,10 @@ const CricketTrajectoryPredictor: React.FC = () => {
           const pct = data.progress != null ? Math.round(data.progress) : 0;
           const fr = data.frame || 0;
           const tot = data.total_frames || 0;
+          const passInfo = data.pass_info ? ` — ${data.pass_info}` : '';
           setStatusText(tot > 0
-            ? `Processing... ${pct}% (${fr}/${tot} frames)`
-            : `AI processing video frames... ${pct}%`);
+            ? `Processing ${pct}% (${fr}/${tot} frames)${passInfo}`
+            : `AI processing... ${pct}%${passInfo}`);
           return;
         }
 
@@ -286,20 +370,23 @@ const CricketTrajectoryPredictor: React.FC = () => {
         }
 
         if (data.status === 'done') {
+          applyJobSummary(data.summary, jobId);
           const stats = data.summary?.ball_stats || {};
-          setFramesProcessed(data.summary?.frames_processed || 0);
-          setBounceEvents(stats.total ?? (data.summary?.bounce_events?.length || 0));
-          setDotCount(stats.dots ?? 0);
-          setRunCount((stats.runs ?? 0) + (stats.boundaries ?? 0));
-          setDeliveries(data.summary?.bounce_events || []);
-          setHitDetected(!!data.summary?.hit_detected);
-          setDeletedBounces(0);
+          const clipCount = data.summary?.clip_count ?? data.summary?.clips?.length ?? 0;
           const ts = Date.now();
-          setVideoUrl(`http://localhost:5000${data.video_url}?t=${ts}`);
-          setDownloadUrl(`http://localhost:5000${data.video_url}?t=${ts}`);
-          setStatusText(`Done! ${stats.total ?? 0} balls — DOT: ${stats.dots ?? 0}, RUN: ${(stats.runs ?? 0) + (stats.boundaries ?? 0)}`);
+          setVideoUrl(buildVideoUrl(`${data.video_url}?t=${ts}`));
+          setDownloadUrl(buildVideoUrl(`${data.video_url}?t=${ts}`));
+          if (data.report_pdf_url) {
+            setReportPdfUrl(buildReportPdfUrl(data.report_pdf_url));
+          }
+          setStatusText(
+            `Done! ${clipCount} clip(s), ${stats.total ?? 0} balls — DOT: ${stats.dots ?? 0}, RUN: ${(stats.runs ?? 0) + (stats.boundaries ?? 0)}`
+          );
           setIsProcessing(false);
           setIsProcessed(true);
+          if (selectedPlayer) {
+            localStorage.removeItem(`active_job_${selectedPlayer.id}`);
+          }
         }
       } catch (error: any) {
         if (pollIntervalRef.current) clearInterval(pollIntervalRef.current);
@@ -307,6 +394,31 @@ const CricketTrajectoryPredictor: React.FC = () => {
         setIsProcessing(false);
       }
     }, 1000);
+  };
+
+  const handlePdfDownload = async () => {
+    const url = reportPdfUrl || (activeJobId ? buildReportPdfUrl(`/report/${activeJobId}.pdf`) : '');
+    if (!url) {
+      setStatusText('No PDF report available yet. Run prediction first.');
+      return;
+    }
+    setStatusText('Downloading PDF report...');
+    try {
+      const response = await fetch(url);
+      if (!response.ok) throw new Error('Report not found');
+      const blob = await response.blob();
+      const blobUrl = window.URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = blobUrl;
+      link.download = `cricket_report_${fileName.replace(/\.[^.]+$/, '')}.pdf`;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      window.URL.revokeObjectURL(blobUrl);
+      setStatusText('PDF report downloaded.');
+    } catch {
+      setStatusText('PDF download failed. Try again after processing completes.');
+    }
   };
 
   const handleDownload = async () => {
@@ -373,10 +485,11 @@ const CricketTrajectoryPredictor: React.FC = () => {
                   </div>
                 )}
               </div>
-              <p style={styles.subtitle}>Upload a cricket video & AI-powered trajectory overlay</p>
+              <p style={styles.subtitle}>Upload any cricket video — all balls tracked (RUN + DOT), queue & PDF report</p>
             </div>
             <div style={styles.headerActions}>
               <div style={{display: 'flex', gap: '10px', alignItems: 'center'}}>
+                <Link href="/analytics" style={styles.authButton}>Analytics</Link>
                 {hasMounted && (isLoggedIn ? (
                   <div style={{ position: 'relative' }} ref={dropdownRef}>
                     <div 
@@ -442,7 +555,7 @@ const CricketTrajectoryPredictor: React.FC = () => {
             ref={fileInputRef}
             id="videoUpload"
             type="file"
-            accept="video/mp4,video/mov,video/avi"
+            accept="video/*,.mp4,.avi,.mov,.mkv,.webm,.m4v"
             onChange={handleFileChange}
             style={styles.hiddenInput}
           />
@@ -499,6 +612,10 @@ const CricketTrajectoryPredictor: React.FC = () => {
                 )}
               </div>
 
+              {selectedFile && videoUrl && !isProcessing && (
+                <PitchCalibration videoUrl={videoUrl} onChange={setPitchCalibration} />
+              )}
+
               <div style={styles.statusBar}>
                 <span style={styles.statusText}>{statusText}</span>
               </div>
@@ -543,6 +660,19 @@ const CricketTrajectoryPredictor: React.FC = () => {
                     <line x1="12" y1="15" x2="12" y2="3"></line>
                   </svg>
                 </button>
+                <button
+                  style={{ ...styles.iconBtn, ...(!isProcessed || (!reportPdfUrl && !activeJobId) ? styles.disabledBtn : {}) }}
+                  onClick={handlePdfDownload}
+                  disabled={!isProcessed || (!reportPdfUrl && !activeJobId)}
+                  title="Download PDF report"
+                >
+                  <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                    <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path>
+                    <polyline points="14 2 14 8 20 8"></polyline>
+                    <line x1="16" y1="13" x2="8" y2="13"></line>
+                    <line x1="16" y1="17" x2="8" y2="17"></line>
+                  </svg>
+                </button>
               </div>
             </div>
 
@@ -567,13 +697,65 @@ const CricketTrajectoryPredictor: React.FC = () => {
                   <span style={{ ...styles.statNumber, color: '#5080FF' }}>{runCount}</span>
                 </div>
                 <div style={styles.statItem}>
+                  <span style={styles.statLabel}>Processing mode</span>
+                  <span style={{ ...styles.statNumber, fontSize: '0.85rem', color: '#38F0B0' }}>
+                    {processingMode || (isProcessing ? 'clip-by-clip' : '—')}
+                  </span>
+                </div>
+                <div style={styles.statItem}>
+                  <span style={styles.statLabel}>Delivery clips</span>
+                  <span style={styles.statNumber}>{clips.length || '—'}</span>
+                </div>
+                <div style={styles.statItem}>
                   <span style={styles.statLabel}>Last shot</span>
                   <span style={{ ...styles.statNumber, color: hitDetected ? '#38F0B0' : '#F03870' }}>{hitDetected ? 'HIT' : 'DOT / NO HIT'}</span>
                 </div>
                 <div style={styles.statItem}>
-                  <span style={styles.statLabel}>Trajectory confidence</span>
-                  <span style={styles.statNumber}>97.3%</span>
+                  <span style={styles.statLabel}>Bounce confidence (avg)</span>
+                  <span style={styles.statNumber}>{avgConfidence > 0 ? `${avgConfidence.toFixed(1)}%` : '—'}</span>
                 </div>
+
+                {clips.length > 0 && (
+                  <div style={styles.deliveryLogSection}>
+                    <div style={styles.deliveryLogTitle}>CLIP-BY-CLIP TRACKING</div>
+                    <div style={{ fontSize: '0.65rem', color: '#8AA898', marginBottom: 6 }}>
+                      Click a clip to jump to that delivery in the video
+                    </div>
+                    <div style={styles.deliveryLogList}>
+                      {clips.map((clip) => {
+                        const outcome = OUTCOME_LABEL[clip.outcome || 'DOTS'] || clip.outcome || '—';
+                        const outcomeColor =
+                          clip.outcome === 'RUNS' || clip.outcome === 'BOUNDARIES' ? '#5080FF'
+                          : clip.outcome === 'WICKETS' ? '#F03870' : '#50DC50';
+                        const lengthKey = clip.length || '';
+                        const lengthText = LENGTH_LABEL[lengthKey] || lengthKey || '—';
+                        const isActive = activeClipIndex === clip.index;
+                        return (
+                          <div
+                            key={`clip-${clip.index}`}
+                            style={{
+                              ...styles.deliveryRow,
+                              ...(isActive ? styles.deliveryRowActive : {}),
+                              cursor: 'pointer',
+                            }}
+                            onClick={() => seekToClip(clip)}
+                            title={`Frames ${clip.start}–${clip.end}`}
+                          >
+                            <span style={styles.deliveryNum}>C{clip.index}</span>
+                            <span style={styles.deliveryLength}>{lengthText}</span>
+                            <span style={{ fontSize: '0.65rem', color: '#8AA898' }}>
+                              {formatTime((clip.start_time ?? clip.start / videoFps))}
+                            </span>
+                            {clip.speed_kmh ? (
+                              <span style={{ fontSize: '0.7rem', color: '#A3C2B2' }}>{Math.round(clip.speed_kmh)} km/h</span>
+                            ) : null}
+                            <span style={{ ...styles.deliveryOutcome, color: outcomeColor }}>{outcome}</span>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                )}
 
                 {deliveries.length > 0 && (
                   <div style={styles.deliveryLogSection}>
@@ -586,10 +768,21 @@ const CricketTrajectoryPredictor: React.FC = () => {
                         const outcomeColor =
                           d.type === 'RUNS' || d.type === 'BOUNDARIES' ? '#5080FF'
                           : d.type === 'WICKETS' ? '#F03870' : '#50DC50';
+                        const speedText = d.speed_kmh ? `${Math.round(d.speed_kmh)} km/h` : '';
                         return (
-                          <div key={`${d.frame ?? i}-${i}`} style={styles.deliveryRow}>
+                          <div
+                            key={`${d.frame ?? i}-${i}`}
+                            style={{ ...styles.deliveryRow, cursor: d.frame ? 'pointer' : 'default' }}
+                            onClick={() => d.frame && seekToFrame(d.frame)}
+                          >
                             <span style={styles.deliveryNum}>#{i + 1}</span>
+                            {d.clip_index != null && (
+                              <span style={{ fontSize: '0.65rem', color: '#8AA898' }}>C{d.clip_index}</span>
+                            )}
                             <span style={styles.deliveryLength}>{lengthText}</span>
+                            {speedText && (
+                              <span style={{ fontSize: '0.7rem', color: '#A3C2B2' }}>{speedText}</span>
+                            )}
                             <span style={{ ...styles.deliveryOutcome, color: outcomeColor }}>{outcome}</span>
                           </div>
                         );
@@ -600,28 +793,75 @@ const CricketTrajectoryPredictor: React.FC = () => {
               </div>
 
               <div style={styles.statsPanel}>
-                <div style={styles.statsTitle}>BOWL TRAJECTORY METRICS</div>
+                <div style={styles.statsTitle}>BOWLING SPEED</div>
                 <div style={styles.statItem}>
-                  <span style={styles.statLabel}>Launch angle (avg)</span>
-                  <span style={styles.statNumber}>14.2Â°</span>
+                  <span style={styles.statLabel}>Average speed</span>
+                  <span style={styles.statNumber}>{avgSpeed > 0 ? `${avgSpeed} km/h` : '—'}</span>
                 </div>
                 <div style={styles.statItem}>
-                  <span style={styles.statLabel}>Ball speed</span>
-                  <span style={styles.statNumber}>127.6 km/h</span>
+                  <span style={styles.statLabel}>Maximum speed</span>
+                  <span style={{ ...styles.statNumber, color: '#FF8C32' }}>
+                    {maxSpeed > 0 ? `${maxSpeed} km/h` : '—'}
+                  </span>
                 </div>
                 <div style={styles.statItem}>
-                  <span style={styles.statLabel}>Spin rate</span>
-                  <span style={styles.statNumber}>2450 rpm</span>
+                  <span style={styles.statLabel}>Pace category</span>
+                  <span style={{ ...styles.statNumber, color: '#38F0B0', fontSize: '0.95rem' }}>
+                    {paceLabel || analytics?.pace_label || '—'}
+                  </span>
+                </div>
+                {analytics?.pace_avg_range && (
+                  <div style={{ fontSize: '0.7rem', color: '#8AA898', marginTop: 4 }}>
+                    Typical avg: {analytics.pace_avg_range} · Max cap: {analytics.pace_max_cap} km/h
+                  </div>
+                )}
+              </div>
+
+              <div style={styles.statsPanel}>
+                <div style={styles.statsTitle}>PITCH METRICS</div>
+                <div style={styles.statItem}>
+                  <span style={styles.statLabel}>Avg bounce position</span>
+                  <span style={styles.statNumber}>
+                    {analytics ? `${analytics.avg_bounce_y}m` : '—'}
+                  </span>
+                </div>
+                <div style={styles.statItem}>
+                  <span style={styles.statLabel}>Accuracy score</span>
+                  <span style={styles.statNumber}>
+                    {analytics ? `${analytics.accuracy_score}%` : '—'}
+                  </span>
                 </div>
               </div>
+
+              {deliveries.length > 0 && (
+                <div style={styles.statsPanel}>
+                  <div style={styles.statsTitle}>LIVE PITCH MAP</div>
+                  <PitchMapCanvas
+                    bounces={deliveries}
+                    width={260}
+                    onBounceClick={(idx) => {
+                      const d = deliveries[idx];
+                      if (d?.frame) seekToFrame(d.frame);
+                    }}
+                  />
+                </div>
+              )}
+
+              {(analytics || deliveries.length > 0) && (
+                <AnalyticsPanel analytics={analytics} avgSpeed={avgSpeed} maxSpeed={maxSpeed} avgConfidence={avgConfidence} />
+              )}
 
               <div style={{ ...styles.statsPanel, ...styles.eventLogPanel }}>
                 <div style={styles.statsTitle}>EVENT LOG</div>
                 <div style={styles.eventLogMsg}>
-                  {bounceEvents} ball{bounceEvents !== 1 ? 's' : ''} tracked — DOT: {dotCount}, RUN: {runCount}.
+                  {clips.length > 0
+                    ? `${clips.length} clip(s) tracked — ${bounceEvents} ball marker(s).`
+                    : `${bounceEvents} ball${bounceEvents !== 1 ? 's' : ''} tracked — DOT: ${dotCount}, RUN: ${runCount}.`}
                 </div>
                 <div style={styles.aiNote}>
-                  Pitch zones on video; delivery details listed in Frame Analysis
+                  {isProcessed && (reportPdfUrl || activeJobId)
+                    ? 'PDF report ready — use the document icon to download summary.'
+                    : 'Clip-by-clip tracking in queue; pitch zones on processed video.'}
                 </div>
               </div>
             </div>
@@ -1099,15 +1339,19 @@ const styles: { [key: string]: React.CSSProperties } = {
     paddingRight: 4,
   },
   deliveryRow: {
-    display: 'grid',
-    gridTemplateColumns: '36px 1fr 48px',
+    display: 'flex',
+    flexWrap: 'wrap',
     alignItems: 'center',
-    gap: 8,
+    gap: 6,
     background: '#071212',
     borderRadius: 8,
     padding: '6px 10px',
     border: '1px solid rgba(60, 210, 140, 0.2)',
     fontSize: '0.78rem',
+  },
+  deliveryRowActive: {
+    border: '1px solid #38F0B0',
+    background: 'rgba(56, 240, 176, 0.08)',
   },
   deliveryNum: {
     color: '#87B7A5',

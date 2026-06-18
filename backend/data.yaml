@@ -1,6 +1,7 @@
-path: C:/Users/Kushagra Agarwal/Desktop/Image-Processing/Ball Tracking/cricket_ball_data
+# Cricket ball YOLO dataset — paths are relative to this file's directory (backend/)
+path: dataset/cricket_ball_data
 train: train/images
 val: valid/images
 
-names: 
+names:
   0: cricketBall

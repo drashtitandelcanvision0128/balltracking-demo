@@ -1,4 +1,6 @@
 cricket_ball_data
+backend/dataset/cricket_ball_data/
+backend/dataset/_kaggle_download/
 myenv
 .venv/
 uploads/
@@ -6,5 +8,6 @@ backend/uploads/
 *.mp4
 
 __pycache__/
+*.pyc
 *.log
 backend/__pycache__/predict_server.cpython-314.pyc

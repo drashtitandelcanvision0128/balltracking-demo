@@ -1,0 +1,24 @@
+{
+  "video": "example_match.mp4",
+  "fps": 30,
+  "deliveries": [
+    {
+      "frame": 120,
+      "bounce_x_m": 0.05,
+      "bounce_y_m": 5.2,
+      "speed_kmh": 125,
+      "outcome": "DOTS",
+      "length_type": "GOOD LENGTH",
+      "track_frames": 28
+    },
+    {
+      "frame": 380,
+      "bounce_x_m": -0.12,
+      "bounce_y_m": 4.8,
+      "speed_kmh": 132,
+      "outcome": "RUNS",
+      "length_type": "GOOD LENGTH",
+      "track_frames": 32
+    }
+  ]
+}
