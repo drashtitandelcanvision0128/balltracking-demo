@@ -120,34 +120,68 @@ def compute_bowling_speed_kmh(
 ) -> float:
     """
     Calibrated bowling speed (km/h) for one delivery track.
-    Typical club: 80–120 avg, elite fast: up to 170–180 max.
+    Calculates speed by taking the total distance traveled during the in-flight
+    segment divided by total time elapsed, which is extremely robust against
+    frame-to-frame pixel tracking jitter.
     """
     if len(raw_pts) < 2 or fps <= 0:
         return 0.0
 
     segment = _in_flight_segment(raw_pts, h_matrix)
+    if len(segment) < 2:
+        segment = raw_pts
 
-    if h_matrix is not None:
-        speeds = _segment_speeds_world(segment, fps, h_matrix)
+    # To reduce single-frame boundary noise, we average the first and last two points if possible
+    if len(segment) >= 4:
+        p0_x = (float(segment[0][0]) + float(segment[1][0])) / 2.0
+        p0_y = (float(segment[0][1]) + float(segment[1][1])) / 2.0
+        pn_x = (float(segment[-1][0]) + float(segment[-2][0])) / 2.0
+        pn_y = (float(segment[-1][1]) + float(segment[-2][1])) / 2.0
+        p0 = (p0_x, p0_y)
+        pn = (pn_x, pn_y)
+        dt = (len(segment) - 2) / max(fps, 1.0)
     else:
-        speeds = _segment_speeds_pixels(segment, fps, height)
+        p0 = segment[0]
+        pn = segment[-1]
+        dt = (len(segment) - 1) / max(fps, 1.0)
 
-    if not speeds:
-        if h_matrix is not None:
-            speeds = _segment_speeds_pixels(segment, fps, height)
-        if not speeds:
-            return 0.0
+    if dt <= 0:
+        return 0.0
 
-    raw_kmh = _robust_peak(speeds)
+    # Calculate real-world distance in meters
+    use_pixels = True
+    if h_matrix is not None:
+        try:
+            w0 = video_to_world(float(p0[0]), float(p0[1]), h_matrix)
+            wn = video_to_world(float(pn[0]), float(pn[1]), h_matrix)
+            dist_m = math.hypot(wn[0] - w0[0], wn[1] - w0[1])
+            # If distance is too small or homography fails, fallback to pixel-based calculation
+            if dist_m > 1.0:
+                use_pixels = False
+        except Exception:
+            pass
+
+    if use_pixels:
+        pitch_span_px = max(height * 0.42, 80.0)
+        meters_per_px = 20.12 / pitch_span_px
+        d_px = math.hypot(float(pn[0]) - float(p0[0]), float(pn[1]) - float(p0[1]))
+        dist_m = d_px * meters_per_px
+
+    # Calculate average speed in km/h
+    avg_speed_kmh = (dist_m / dt) * 3.6
+
+    # Release speed is higher than average speed due to air resistance (drag).
+    # Typically, a cricket ball loses ~10% speed before bounce, so we scale by 1.10.
+    raw_kmh = avg_speed_kmh * 1.10
 
     # Stump-width reference correction from pitch calibration
     if stump_scale and abs(stump_scale - 1.0) > 0.02:
         raw_kmh = raw_kmh / stump_scale
 
-    # If homography still overshoots (jitter), scale down toward realistic band
-    if raw_kmh > GLOBAL_MAX_KMH:
-        scale = GLOBAL_MAX_KMH / raw_kmh
-        raw_kmh = raw_kmh * min(scale, 0.65)
+    # If the computed speed is still unrealistically high (e.g. tracking anomaly),
+    # softly compress it rather than hard-capping to 180 or collapsing to 180.
+    if raw_kmh > 150.0:
+        raw_kmh = 150.0 + (raw_kmh - 150.0) * 0.15
 
     return clamp_speed(raw_kmh)
 

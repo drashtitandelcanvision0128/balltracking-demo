@@ -734,6 +734,10 @@ def track_delivery_clip(cap, clip, model, fps, width, height, h_matrix, dt,
         if ENABLE_POSE and POSE_ESTIMATOR and delivery_pose_frames:
             pose_samples = POSE_ESTIMATOR.sample_delivery_poses(delivery_pose_frames, max_samples=3)
 
+        # Get dynamic batsman zone to pass to classify_miss
+        from core.hit_detector import batsman_zone_from_pose
+        _, y_max_val = batsman_zone_from_pose(pose_samples, height)
+
         if ENABLE_POSE and event_status in ("BOWLED", "POST_HIT") and len(delivery_pose_frames) < 4:
             if frame_index % 4 == 0:
                 delivery_pose_frames.append((frame_index, frame))
@@ -768,7 +772,7 @@ def track_delivery_clip(cap, clip, model, fps, width, height, h_matrix, dt,
                 else:
                     bounced_this_delivery = False
 
-        if event_status == "BOWLED" and not hit_occurred:
+        if event_status in ("BOWLED", "MISS") and not hit_occurred:
             is_hit, hit_conf, contact = score_hit_enhanced(
                 raw_list, hist, height, fps, bounced_this_delivery, frames_since_bounce,
                 bounce_hist_idx=bounce_hist_idx, pose_frames=pose_samples)
@@ -799,7 +803,7 @@ def track_delivery_clip(cap, clip, model, fps, width, height, h_matrix, dt,
                 if persistent_video_bounces and persistent_video_bounces[-1]['label'] == 'RUNS':
                     _relable_last_bounce(job_bounces, session_bounces, persistent_video_bounces, 'BOUNDARIES')
 
-        if event_status == "BOWLED" and bounced_this_delivery and classify_miss(hist, height, hit_occurred, bounced_this_delivery):
+        if event_status == "BOWLED" and bounced_this_delivery and classify_miss(hist, height, hit_occurred, bounced_this_delivery, batsman_y_max=y_max_val):
             event_status = "MISS"
             _relable_last_bounce(job_bounces, session_bounces, persistent_video_bounces, 'WICKETS')
 
@@ -1325,6 +1329,10 @@ def process_video(input_path, output_path, job_id=None, options=None):
         if ENABLE_POSE and POSE_ESTIMATOR and delivery_pose_frames:
             pose_samples = POSE_ESTIMATOR.sample_delivery_poses(delivery_pose_frames, max_samples=3)
 
+        # Get dynamic batsman zone to pass to classify_miss
+        from core.hit_detector import batsman_zone_from_pose
+        _, y_max_val = batsman_zone_from_pose(pose_samples, height)
+
         if ENABLE_POSE and event_status in ("BOWLED", "POST_HIT") and len(delivery_pose_frames) < 4:
             if frame_index % 4 == 0:
                 delivery_pose_frames.append((frame_index, frame))
@@ -1387,7 +1395,7 @@ def process_video(input_path, output_path, job_id=None, options=None):
                 pre_hit_speed = st['pre_hit_speed']
 
         # ---- Hit & Miss Status Updates ----
-        if event_status == "BOWLED" and not hit_occurred:
+        if event_status in ("BOWLED", "MISS") and not hit_occurred:
             is_hit, hit_conf, contact = score_hit_enhanced(
                 raw_list, hist, height, fps, bounced_this_delivery, frames_since_bounce,
                 bounce_hist_idx=bounce_hist_idx, pose_frames=pose_samples)
@@ -1419,7 +1427,7 @@ def process_video(input_path, output_path, job_id=None, options=None):
                     _relable_last_bounce(job_bounces, session_bounces, persistent_video_bounces, 'BOUNDARIES')
                     print(f"[Frame {frame_index}] Boundary")
 
-        if event_status == "BOWLED" and bounced_this_delivery and classify_miss(hist, height, hit_occurred, bounced_this_delivery):
+        if event_status == "BOWLED" and bounced_this_delivery and classify_miss(hist, height, hit_occurred, bounced_this_delivery, batsman_y_max=y_max_val):
             event_status = "MISS"
             _relable_last_bounce(job_bounces, session_bounces, persistent_video_bounces, 'WICKETS')
             print(f"[Frame {frame_index}] MISS — wicket/leave")

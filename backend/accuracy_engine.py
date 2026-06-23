@@ -200,15 +200,20 @@ def score_hit_post_bounce(hist_pts, height, fps, bounce_idx):
     """
     After pitch bounce, scan forward for bat-contact deflection in batting zone.
     """
-    if bounce_idx is None or bounce_idx >= len(hist_pts) - 4:
+    if bounce_idx is None or bounce_idx >= len(hist_pts) - 2:
         return False, 0.0, None
 
-    post = hist_pts[bounce_idx:]
     best_conf = 0.0
     best_contact = None
 
-    for i in range(2, len(post) - 2):
-        p1, p2, p3, p4, p5 = post[i - 2], post[i - 1], post[i], post[i + 1], post[i + 2]
+    # Scan starting from bounce_idx - 1 or bounce_idx to allow hit detection
+    # right at the bounce or 1 frame after the bounce.
+    # We must ensure we have at least 2 points before and after the candidate contact index.
+    start_idx = max(2, bounce_idx - 1)
+    end_idx = len(hist_pts) - 2
+
+    for idx in range(start_idx, end_idx):
+        p1, p2, p3, p4, p5 = hist_pts[idx - 2], hist_pts[idx - 1], hist_pts[idx], hist_pts[idx + 1], hist_pts[idx + 2]
         cy = p3[1]
         if cy < height * BATSMAN_ZONE_Y_MIN or cy > height * BATSMAN_ZONE_Y_MAX:
             continue
@@ -243,8 +248,14 @@ def score_hit_post_bounce(hist_pts, height, fps, bounce_idx):
             score += 0.18
         if upward_after and angle >= 12:
             score += 0.12
+            
+        # Prevent false hit on the bounce itself if there's no lateral deflection or reversal
+        if abs(idx - bounce_idx) <= 1 and lateral < 8 and not reversed_forward:
+            score -= 0.30
+
         # Bat contact after bounce — don't penalise small bounce-like motion at contact
-        if i <= 4 and angle >= 16 and lateral >= 8:
+        rel_idx = idx - bounce_idx
+        if rel_idx <= 4 and angle >= 16 and lateral >= 8:
             score += 0.10
 
         confidence = max(0.0, min(1.0, score))
@@ -264,12 +275,7 @@ def score_hit(raw_pts, hist_pts, height, fps, bounced, frames_since_bounce, boun
         return False, 0.0, None
 
     if bounced and bounce_hist_idx is not None:
-        if frames_since_bounce >= POST_BOUNCE_HIT_COOLDOWN_FRAMES:
-            return score_hit_post_bounce(hist_pts, height, fps, bounce_hist_idx)
-        return False, 0.0, None
-
-    if bounced and frames_since_bounce < POST_BOUNCE_HIT_COOLDOWN_FRAMES:
-        return False, 0.0, None
+        return score_hit_post_bounce(hist_pts, height, fps, bounce_hist_idx)
 
     p1, p2, p3, p4, p5 = hist_pts[-5], hist_pts[-4], hist_pts[-3], hist_pts[-2], hist_pts[-1]
     contact = p3
@@ -343,18 +349,21 @@ def classify_boundary(hist_pts, post_hit_max_speed, height, pre_hit_speed):
     return fast and (wide or high_shot)
 
 
-def classify_miss(hist_pts, height, hit_occurred, bounced):
+def classify_miss(hist_pts, height, hit_occurred, bounced, batsman_y_max=0.92):
     """Ball passed batsman without contact — wicket / leave."""
     if hit_occurred or not bounced or len(hist_pts) < 4:
         return False
     recent = hist_pts[-4:]
     # Monotonic downward in frame (toward keeper/stumps)
     ys = [p[1] for p in recent]
-    if ys[-1] < height * 0.78:
+    
+    # Dynamic threshold based on batsman_y_max, with a safe upper limit of 70% height
+    miss_y_threshold = max(height * 0.70, height * (batsman_y_max - 0.15))
+    if ys[-1] < miss_y_threshold:
         return False
+        
     downward = all(ys[i + 1] >= ys[i] - 2 for i in range(len(ys) - 1))
-    last_y = ys[-1]
-    return downward and last_y > height * 0.80
+    return downward
 
 
 def snap_to_pitch(px, py, pitch_l, pitch_r, pitch_top, pitch_bot, margin=8):
