@@ -68,10 +68,10 @@ def detect_ball_light(
         x1, y1, x2, y2 = box.xyxy[0].tolist()
         bw, bh = (x2 - x1) * inv, (y2 - y1) * inv
         area = bw * bh
-        if area < 12 or area > 15000:
+        if area < 12 or area > 1600:
             continue
         aspect = bw / (bh + 1e-5)
-        if not (0.15 < aspect < 5.0):
+        if not (0.3 < aspect < 3.0):
             continue
         conf = float(box.conf[0].item())
         if conf > best_conf:

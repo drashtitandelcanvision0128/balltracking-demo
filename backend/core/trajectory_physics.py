@@ -109,8 +109,19 @@ def refine_bounce_world(
     if best_i is None:
         return None
     px, py = segment[best_i]
-    if py < height * 0.18:
+    if py < height * 0.43:
         return None
+
+    # Verify that the ball has actually risen (Y-coordinate decreased in pixels)
+    # in the subsequent frames to avoid false bounces while in the air.
+    has_risen = False
+    for j in range(best_i + 1, len(segment)):
+        if segment[j][1] < py - 6:
+            has_risen = True
+            break
+    if not has_risen:
+        return None
+
     return int(px), int(py)
 
 

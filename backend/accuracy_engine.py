@@ -148,8 +148,24 @@ def refine_bounce_point(raw_pts, height, lookback=14):
         y0, y1, y2, y3, y4 = (segment[j][1] for j in (i - 2, i - 1, i, i + 1, i + 2))
         if not (y1 < y2 and y3 < y2 and y0 < y2):
             continue
-        if y2 < height * 0.22:
+        if y2 < height * 0.43:
             continue
+
+        # Prevent false bounce detections in the air:
+        # 1. The bounce candidate (y2) must be very close to the lowest tracked point (maximum Y) in the segment.
+        max_y_in_segment = max(p[1] for p in segment)
+        if y2 < max_y_in_segment - 3:
+            continue
+
+        # 2. The ball must have risen (Y-coordinate decreased) in the frames after the bounce candidate.
+        has_risen = False
+        for j in range(i + 1, n):
+            if segment[j][1] < y2 - 6:
+                has_risen = True
+                break
+        if not has_risen:
+            continue
+
         depth = (y2 - y1) + (y2 - y3)
         flatness = abs(y1 - y3)
         score = depth - flatness * 0.5
