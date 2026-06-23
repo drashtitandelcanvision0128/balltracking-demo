@@ -89,7 +89,7 @@ def can_start_new_delivery(
     detection_conf: float,
     from_waiting: bool,
 ) -> bool:
-    if frame_index - last_marker_frame < min_gap_frames(fps):
+    if frame_index - last_marker_frame < 5:
         return False
     if from_waiting and detection_conf < MIN_NEW_DET_CONF:
         return False
@@ -106,7 +106,6 @@ def should_register_marker(
     strict: bool = False,
 ) -> bool:
     """Register bounce/hit marker if cooldown passed and track has real motion."""
-    min_gap = min_gap_frames(fps) if strict else max(6, int(fps * 0.28))
-    if frame_index - last_marker_frame < min_gap:
+    if frame_index - last_marker_frame < 5:
         return False
     return is_valid_delivery_track(raw_pts, height, fps, strict=strict)

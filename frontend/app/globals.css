@@ -24,3 +24,34 @@ body {
   color: var(--foreground);
   font-family: Arial, Helvetica, sans-serif;
 }
+
+/* Custom modern dark-green scrollbar */
+::-webkit-scrollbar,
+*::-webkit-scrollbar {
+  width: 8px !important;
+  height: 8px !important;
+}
+
+::-webkit-scrollbar-track,
+*::-webkit-scrollbar-track {
+  background: #0A1216 !important; /* matches container background */
+  border-radius: 6px !important;
+}
+
+::-webkit-scrollbar-thumb,
+*::-webkit-scrollbar-thumb {
+  background: #142A24 !important; /* matches dark-green theme button background */
+  border: 1.5px solid rgba(56, 240, 176, 0.25) !important;
+  border-radius: 6px !important;
+}
+
+::-webkit-scrollbar-thumb:hover,
+*::-webkit-scrollbar-thumb:hover {
+  background: #38F0B0 !important; /* glowing brand green accent */
+}
+
+/* Firefox compatibility */
+* {
+  scrollbar-width: thin !important;
+  scrollbar-color: #142A24 #0A1216 !important;
+}

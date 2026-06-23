@@ -44,7 +44,7 @@ const CricketTrajectoryPredictor: React.FC = () => {
   const [isProcessed, setIsProcessed] = useState<boolean>(false);
   const [videoUrl, setVideoUrl] = useState<string>('');
   const [downloadUrl, setDownloadUrl] = useState<string>('');
-  const [framesProcessed, setFramesProcessed] = useState<number>(843);
+  const [framesProcessed, setFramesProcessed] = useState<number>(0);
   const [bounceEvents, setBounceEvents] = useState<number>(0);
   const [dotCount, setDotCount] = useState<number>(0);
   const [runCount, setRunCount] = useState<number>(0);
@@ -155,6 +155,10 @@ const CricketTrajectoryPredictor: React.FC = () => {
       setIsProcessed(false);
       setDeliveries([]);
       setClips([]);
+      setFramesProcessed(0);
+      setBounceEvents(0);
+      setDotCount(0);
+      setRunCount(0);
       setAnalytics(null);
       setReportPdfUrl('');
       setActiveJobId('');
@@ -233,8 +237,8 @@ const CricketTrajectoryPredictor: React.FC = () => {
     const clipList: DeliveryClip[] = (summary?.clips as DeliveryClip[]) || [];
     setFramesProcessed((summary?.frames_processed as number) || 0);
     setBounceEvents(stats.total ?? events.length);
-    setDotCount(stats.dots ?? 0);
-    setRunCount((stats.runs ?? 0) + (stats.boundaries ?? 0));
+    setDotCount((stats.dots ?? 0) + (stats.wickets ?? 0));
+    setRunCount((stats.runs ?? 0) + (stats.boundaries ?? 0) * 4);
     setDeliveries(events);
     setClips(clipList);
     setHitDetected(!!summary?.hit_detected);
@@ -380,7 +384,7 @@ const CricketTrajectoryPredictor: React.FC = () => {
             setReportPdfUrl(buildReportPdfUrl(data.report_pdf_url));
           }
           setStatusText(
-            `Done! ${clipCount} clip(s), ${stats.total ?? 0} balls — DOT: ${stats.dots ?? 0}, RUN: ${(stats.runs ?? 0) + (stats.boundaries ?? 0)}`
+            `Done! ${clipCount} clip(s), ${stats.total ?? 0} balls played (${(stats.runs ?? 0) + (stats.boundaries ?? 0) * 4} runs scored) — DOT: ${stats.dots ?? 0}`
           );
           setIsProcessing(false);
           setIsProcessed(true);
@@ -633,6 +637,10 @@ const CricketTrajectoryPredictor: React.FC = () => {
                       setStatusText('Selection cancelled.');
                       setIsProcessing(false);
                       setIsProcessed(false);
+                      setFramesProcessed(0);
+                      setBounceEvents(0);
+                      setDotCount(0);
+                      setRunCount(0);
                       if (fileInputRef.current) {
                         fileInputRef.current.value = '';
                       }
@@ -685,15 +693,15 @@ const CricketTrajectoryPredictor: React.FC = () => {
                   <span style={styles.statNumber}>{framesProcessed}</span>
                 </div>
                 <div style={styles.statItem}>
-                  <span style={styles.statLabel}>Total balls tracked</span>
+                  <span style={styles.statLabel}>Balls Played</span>
                   <span style={styles.statNumber}>{bounceEvents}</span>
                 </div>
                 <div style={styles.statItem}>
-                  <span style={styles.statLabel}>DOT (not hit / no run)</span>
+                  <span style={styles.statLabel}>Dot Balls (not hit / no run)</span>
                   <span style={{ ...styles.statNumber, color: '#50DC50' }}>{dotCount}</span>
                 </div>
                 <div style={styles.statItem}>
-                  <span style={styles.statLabel}>RUN (hit for runs)</span>
+                  <span style={styles.statLabel}>Runs Scored</span>
                   <span style={{ ...styles.statNumber, color: '#5080FF' }}>{runCount}</span>
                 </div>
                 <div style={styles.statItem}>
@@ -706,10 +714,10 @@ const CricketTrajectoryPredictor: React.FC = () => {
                   <span style={styles.statLabel}>Delivery clips</span>
                   <span style={styles.statNumber}>{clips.length || '—'}</span>
                 </div>
-                <div style={styles.statItem}>
+                {/* <div style={styles.statItem}>
                   <span style={styles.statLabel}>Last shot</span>
                   <span style={{ ...styles.statNumber, color: hitDetected ? '#38F0B0' : '#F03870' }}>{hitDetected ? 'HIT' : 'DOT / NO HIT'}</span>
-                </div>
+                </div> */}
                 <div style={styles.statItem}>
                   <span style={styles.statLabel}>Bounce confidence (avg)</span>
                   <span style={styles.statNumber}>{avgConfidence > 0 ? `${avgConfidence.toFixed(1)}%` : '—'}</span>
