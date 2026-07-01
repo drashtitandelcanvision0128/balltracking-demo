@@ -140,7 +140,7 @@ def calibrate_pitch_robust(
     *,
     manual_quad: np.ndarray | list | None = None,
     max_samples: int = 30,
-    blend_fallback: float = 0.55,
+    blend_fallback: float = 0.05,
 ) -> CalibrationResult:
     """
     Best-available pitch quad for homography.

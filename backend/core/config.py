@@ -57,7 +57,7 @@ _DEFAULTS: dict[str, Any] = {
         "show_trajectory_lines": False,
         "show_corner_pitch_map": False,
         "show_summary_pitch_map": False,
-        "show_pitch_zone_overlay": True,
+        "show_pitch_zone_overlay": False,
     },
     "database": {
         "url": os.environ.get(

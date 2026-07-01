@@ -1,5 +1,5 @@
 model:
-  confidence: 0.10
+  confidence: 0.15
   image_size: 1280
   path: runs/detect/train5/weights/best.pt
   tracker: bytetrack
@@ -7,12 +7,12 @@ physics:
   hit_angle_threshold: 35
   speed_range:
   - 80
-  - 180
+  - 160
   spin_multiplier: 0.4
   swing_multiplier: 0.2
 bowling_speed:
   global_min_kmh: 70
-  global_max_kmh: 180
+  global_max_kmh: 160
   tiers:
   - id: medium
     label: Medium Pace
@@ -28,7 +28,7 @@ bowling_speed:
     label: Fast Bowling
     avg_min: 130
     avg_max: 160
-    max_speed: 180
+    max_speed: 160
 processing:
   ffmpeg_path: ffmpeg
   max_file_size_mb: 500
@@ -67,7 +67,7 @@ visualization:
   show_trajectory_lines: false
   show_corner_pitch_map: false
   show_summary_pitch_map: false
-  show_pitch_zone_overlay: true
+  show_pitch_zone_overlay: false
 database:
   url: sqlite:///cricket_analytics.db
 redis:
@@ -91,10 +91,10 @@ gpu:
   calibration_samples: 30
   summary_seconds: 1
 delivery_filter:
-  min_track_frames: 3
-  min_track_frames_strict: 5
-  min_y_travel_ratio: 0.028
-  min_delivery_gap_sec: 0.40
-  min_new_detection_conf: 0.12
+  min_track_frames: 10
+  min_track_frames_strict: 12
+  min_y_travel_ratio: 0.15
+  min_delivery_gap_sec: 0.80
+  min_new_detection_conf: 0.30
   absurd_speed_kmh: 350
-  min_frames_between_markers: 10
+  min_frames_between_markers: 18

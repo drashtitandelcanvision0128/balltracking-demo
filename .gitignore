@@ -4,6 +4,7 @@ backend/dataset/_kaggle_download/
 backend/dataset/hard_negatives/
 myenv
 .venv/
+.venv_disabled/
 uploads/
 backend/uploads/
 *.mp4

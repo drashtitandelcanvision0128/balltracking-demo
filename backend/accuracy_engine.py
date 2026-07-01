@@ -143,38 +143,30 @@ def refine_bounce_point(raw_pts, height, lookback=14):
     start = max(0, len(raw_pts) - lookback)
     segment = raw_pts[start:]
     n = len(segment)
-    best_i, best_score = None, -1e9
-    for i in range(2, n - 2):
-        y0, y1, y2, y3, y4 = (segment[j][1] for j in (i - 2, i - 1, i, i + 1, i + 2))
-        if not (y1 < y2 and y3 < y2 and y0 < y2):
-            continue
-        if y2 < height * 0.43:
-            continue
-
-        # Prevent false bounce detections in the air:
-        # 1. The bounce candidate (y2) must be very close to the lowest tracked point (maximum Y) in the segment.
-        max_y_in_segment = max(p[1] for p in segment)
-        if y2 < max_y_in_segment - 3:
-            continue
-
-        # 2. The ball must have risen (Y-coordinate decreased) in the frames after the bounce candidate.
-        has_risen = False
-        for j in range(i + 1, n):
-            if segment[j][1] < y2 - 6:
-                has_risen = True
+    # Find the maximum Y coordinate (absolute lowest point on screen)
+    max_y = max(p[1] for p in segment)
+    
+    # We want the *start* of the bounce (first point very close to the lowest point)
+    # The ball must have risen after this point for it to be a real bounce.
+    has_risen = False
+    
+    best_idx = -1
+    for i, p in enumerate(segment):
+        if p[1] >= max_y - 4:
+            # Check if it actually rises after this point to avoid false positives
+            for j in range(i + 1, len(segment)):
+                if segment[j][1] < p[1] - 3:
+                    has_risen = True
+                    break
+                    
+            if has_risen:
+                best_idx = i
                 break
-        if not has_risen:
-            continue
-
-        depth = (y2 - y1) + (y2 - y3)
-        flatness = abs(y1 - y3)
-        score = depth - flatness * 0.5
-        if score > best_score:
-            best_score = score
-            best_i = i
-    if best_i is None:
+                
+    if best_idx == -1:
         return None
-    return segment[best_i]
+        
+    return segment[best_idx]
 
 
 def _segment_speeds(raw_pts, fps):
