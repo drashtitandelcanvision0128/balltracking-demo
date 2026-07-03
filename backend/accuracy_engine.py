@@ -133,40 +133,132 @@ def calibrate_pitch_from_video(cap, width, height, fallback_quad, max_samples=40
     return out.astype(np.float32)
 
 
-def refine_bounce_point(raw_pts, height, lookback=14):
+# Feet band (strict) vs crease band (track-start guard)
+FEET_ZONE_Y_RATIO = 0.58
+CREASE_MAX_FRAME_Y_RATIO = 0.52
+CREASE_MIN_PITCH_Y_M = 3.0
+FEET_MIN_PITCH_Y_M = 2.0
+MIN_BOUNCE_PITCH_Y_M = 2.8
+
+
+def in_batsman_feet_zone(vx, vy, height, h_matrix=None):
+    """Bottom of frame / stumps line — never place a bounce marker here."""
+    if vy > height * FEET_ZONE_Y_RATIO:
+        return True
+    if h_matrix is not None:
+        try:
+            from core.pitch_coords import video_to_world
+            _, y_m = video_to_world(float(vx), float(vy), h_matrix)
+            if y_m < FEET_MIN_PITCH_Y_M:
+                return True
+        except Exception:
+            pass
+    return False
+
+
+def in_batsman_crease_zone(vx, vy, height, h_matrix=None):
+    """Wider batting end — block starting junk tracks, not pitch bounces."""
+    if vy > height * CREASE_MAX_FRAME_Y_RATIO:
+        return True
+    if h_matrix is not None:
+        try:
+            from core.pitch_coords import video_to_world
+            _, y_m = video_to_world(float(vx), float(vy), h_matrix)
+            if y_m < CREASE_MIN_PITCH_Y_M:
+                return True
+        except Exception:
+            pass
+    return False
+
+
+def refine_bounce_point(raw_pts, height, lookback=14, h_matrix=None):
     """
-    Find bounce apex using local Y minima after downward motion (more stable than 3-frame diff).
-    lookback limits search to recent frames so older bounces in the same track are ignored.
+    Real pitch bounce — prefer world coords (bowler-end safe), else strict pixel arc.
+    Skips early flight segment where bowler-end view fakes a bounce.
     """
-    if len(raw_pts) < 5:
+    if h_matrix is not None and len(raw_pts) >= 8:
+        from core.trajectory_physics import refine_bounce_world
+        world_pt = refine_bounce_world(
+            raw_pts, h_matrix, height, lookback=lookback or len(raw_pts),
+        )
+        if world_pt is not None:
+            bx, by = world_pt
+            if not in_batsman_feet_zone(bx, by, height, h_matrix):
+                return world_pt
+
+    if len(raw_pts) < 8:
         return None
     start = max(0, len(raw_pts) - lookback)
     segment = raw_pts[start:]
-    n = len(segment)
-    # Find the maximum Y coordinate (absolute lowest point on screen)
-    max_y = max(p[1] for p in segment)
-    
-    # We want the *start* of the bounce (first point very close to the lowest point)
-    # The ball must have risen after this point for it to be a real bounce.
-    has_risen = False
-    
-    best_idx = -1
-    for i, p in enumerate(segment):
-        if p[1] >= max_y - 4:
-            # Check if it actually rises after this point to avoid false positives
-            for j in range(i + 1, len(segment)):
-                if segment[j][1] < p[1] - 3:
-                    has_risen = True
-                    break
-                    
-            if has_risen:
-                best_idx = i
-                break
-                
-    if best_idx == -1:
+
+    end_idx = len(segment)
+    for i, (x, y) in enumerate(segment):
+        if in_batsman_feet_zone(x, y, height, h_matrix):
+            end_idx = max(8, i)
+            break
+    pitch_seg = segment[:end_idx]
+    if len(pitch_seg) < 8:
         return None
-        
-    return segment[best_idx]
+
+    min_i = max(3, int(len(pitch_seg) * 0.35))
+
+    for i in range(min_i, len(pitch_seg) - 2):
+        bx, by = pitch_seg[i]
+        if in_batsman_feet_zone(bx, by, height, h_matrix):
+            continue
+        if h_matrix is not None:
+            from pitch_map_renderer import is_on_pitch
+            if not is_on_pitch(bx, by, h_matrix, margin=12):
+                continue
+            try:
+                from core.pitch_coords import video_to_world
+                _, y_m = video_to_world(float(bx), float(by), h_matrix)
+                if y_m < MIN_BOUNCE_PITCH_Y_M or y_m > 19.5:
+                    continue
+                start_y = video_to_world(float(pitch_seg[0][0]), float(pitch_seg[0][1]), h_matrix)[1]
+                if start_y - y_m < 3.0:
+                    continue
+            except Exception:
+                continue
+        elif by < height * 0.28 or by > height * 0.55:
+            continue
+
+        if i >= 3 and pitch_seg[i][1] - pitch_seg[i - 3][1] < height * 0.04:
+            continue
+
+        ys = [pitch_seg[j][1] for j in range(i - 2, i + 3)]
+        if not (ys[1] > ys[2] and ys[3] > ys[2] and ys[0] > ys[2]):
+            continue
+        if not any(segment[j][1] < by - 6 for j in range(i + 1, len(segment))):
+            continue
+        return (int(bx), int(by))
+    return None
+
+
+def is_valid_marker_point(bx, by, height, h_matrix=None, raw_pts=None, fps=25.0):
+    """Block markers on feet or junk tracks; allow real pitch bounces."""
+    if in_batsman_feet_zone(bx, by, height, h_matrix):
+        return False
+    if h_matrix is not None:
+        from pitch_map_renderer import is_on_pitch
+        if not is_on_pitch(bx, by, h_matrix, margin=12):
+            return False
+        try:
+            from core.pitch_coords import video_to_world
+            _, y_m = video_to_world(float(bx), float(by), h_matrix)
+            if y_m < MIN_BOUNCE_PITCH_Y_M or y_m > 19.5:
+                return False
+        except Exception:
+            return False
+    elif by < height * 0.22 or by > height * 0.55:
+        return False
+    if raw_pts is not None:
+        from core.delivery_filter import is_feet_false_track, is_plausible_ball_track
+        if is_feet_false_track(raw_pts, height, fps, h_matrix):
+            return False
+        if not is_plausible_ball_track(raw_pts, height, fps, h_matrix):
+            return False
+    return True
 
 
 def _segment_speeds(raw_pts, fps):

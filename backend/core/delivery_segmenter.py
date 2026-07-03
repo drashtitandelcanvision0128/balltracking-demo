@@ -68,10 +68,10 @@ def detect_ball_light(
         x1, y1, x2, y2 = box.xyxy[0].tolist()
         bw, bh = (x2 - x1) * inv, (y2 - y1) * inv
         area = bw * bh
-        if area < 12 or area > 1600:
+        if area < 25 or area > 550:  # Tighter size range
             continue
         aspect = bw / (bh + 1e-5)
-        if not (0.3 < aspect < 3.0):
+        if not (0.75 < aspect < 1.35):  # Ball is ROUND
             continue
         conf = float(box.conf[0].item())
         if conf > best_conf:
@@ -110,7 +110,7 @@ def segment_deliveries(
     last_ball_frame = 0
     last_marker_frame = -9999
     frame_idx = 0
-    scan_conf = max(conf_thresh, SCAN_CONF)
+    scan_conf = min(conf_thresh, SCAN_CONF)  # Use LOWER confidence for initial clip scan
 
     while True:
         ret, frame = cap.read()

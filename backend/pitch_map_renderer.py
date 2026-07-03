@@ -68,8 +68,8 @@ RUNS_LEGEND = [
 TEMPLATE_CORNERS = np.array([
     [PITCH_L, PITCH_TOP],
     [PITCH_R, PITCH_TOP],
-    [PITCH_L, PITCH_BOT],
     [PITCH_R, PITCH_BOT],
+    [PITCH_L, PITCH_BOT],
 ], dtype=np.float32)
 
 

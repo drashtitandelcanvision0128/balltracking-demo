@@ -133,6 +133,40 @@ def _stump_scale_from_quad(quad: np.ndarray, width: int) -> float:
     return float(np.clip(expected_px / top_w, 0.75, 1.35))
 
 
+def normalize_manual_quad(quad: np.ndarray | list) -> np.ndarray:
+    """Normalize a 4-point manual quad to the expected bowler-end-oriented order.
+
+    Expected order is:
+    0 = top-left (bowler end)
+    1 = top-right
+    2 = bottom-right
+    3 = bottom-left (batsman end)
+
+    If the user provides a clockwise quad from a different origin, this reorders it to
+    the canonical form while preserving the shape.
+    """
+    pts = np.array(quad, dtype=np.float32).reshape(4, 2)
+    if pts.shape != (4, 2):
+        raise ValueError("manual quad must contain 4 points")
+
+    # Start from the point closest to the top-left corner, then sort by angle around centroid.
+    centroid = pts.mean(axis=0)
+    angles = np.arctan2(pts[:, 1] - centroid[1], pts[:, 0] - centroid[0])
+    order = np.argsort(angles)
+    pts = pts[order]
+
+    # Re-map to the same corner order as the template homography:
+    # top-left, top-right, bottom-right, bottom-left.
+    y_sorted = pts[np.argsort(pts[:, 1])]
+    top = y_sorted[:2]
+    bottom = y_sorted[2:]
+    top_left = top[np.argmin(top[:, 0])]
+    top_right = top[np.argmax(top[:, 0])]
+    bottom_right = bottom[np.argmax(bottom[:, 0])]
+    bottom_left = bottom[np.argmin(bottom[:, 0])]
+    return np.array([top_left, top_right, bottom_right, bottom_left], dtype=np.float32)
+
+
 def calibrate_pitch_robust(
     cap,
     width: int,
@@ -149,7 +183,7 @@ def calibrate_pitch_robust(
     fallback = auto_pitch_quad(width, height)
 
     if manual_quad is not None:
-        quad = np.array(manual_quad, dtype=np.float32).reshape(4, 2)
+        quad = normalize_manual_quad(manual_quad)
         return CalibrationResult(
             quad=quad,
             source="manual",

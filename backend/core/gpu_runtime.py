@@ -18,8 +18,8 @@ _HALF = False
 _GPU_NAME: str | None = None
 
 
-def require_gpu() -> None:
-    """Exit if CUDA is not available (user wants GPU-only runs)."""
+def require_gpu() -> bool:
+    """Return True when CUDA is available; otherwise fall back to CPU."""
     try:
         import torch
     except ImportError as exc:
@@ -27,12 +27,16 @@ def require_gpu() -> None:
         raise SystemExit(1) from exc
 
     if not torch.cuda.is_available():
-        print(
-            "[GPU] CUDA not available. Install CUDA PyTorch:\n"
-            "  pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124",
-            file=sys.stderr,
-        )
-        raise SystemExit(1)
+        if _GPU_CFG.get("require_cuda", False):
+            print(
+                "[GPU] CUDA not available. Falling back to CPU inference."
+                " Install CUDA PyTorch for faster GPU runs if needed.",
+                file=sys.stderr,
+            )
+        else:
+            print("[GPU] CUDA not available; using CPU inference.", file=sys.stderr)
+        return False
+    return True
 
 
 def init_gpu_runtime() -> tuple[int | str, bool, str | None]:
@@ -44,9 +48,15 @@ def init_gpu_runtime() -> tuple[int | str, bool, str | None]:
     if _INITIALIZED:
         return _DEVICE, _HALF, _GPU_NAME
 
-    require_gpu()
-
     import torch
+
+    if not require_gpu():
+        _DEVICE = "cpu"
+        _HALF = False
+        _GPU_NAME = None
+        _INITIALIZED = True
+        print("[GPU] Using CPU inference")
+        return _DEVICE, _HALF, _GPU_NAME
 
     if _GPU_CFG.get("allow_tf32", True):
         torch.backends.cuda.matmul.allow_tf32 = True

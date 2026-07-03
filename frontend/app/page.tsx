@@ -2,7 +2,6 @@
 import React, { useState, useRef, useCallback, useEffect } from 'react';
 import Link from 'next/link';
 import AnalyticsPanel from '../components/AnalyticsPanel';
-// import PitchMapCanvas from '../components/PitchMapCanvas';
 // import PitchCalibration, { type PitchPoint } from '../components/PitchCalibration';
 import { API_BASE, buildVideoUrl, buildReportPdfUrl, type Analytics, type BounceEvent, type DeliveryClip } from '../lib/api';
 

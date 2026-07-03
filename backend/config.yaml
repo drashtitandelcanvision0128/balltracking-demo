@@ -1,5 +1,5 @@
 model:
-  confidence: 0.15
+  confidence: 0.35
   image_size: 1280
   path: runs/detect/train5/weights/best.pt
   tracker: bytetrack
@@ -39,7 +39,7 @@ processing:
   clip_start_padding: 15
   clip_end_padding: 50
   clip_lost_sec: 1.15
-  clip_scan_conf: 0.10
+  clip_scan_conf: 0.08
   clip_deep_imgsz: 1280
   supported_formats:
   - .mp4
@@ -73,7 +73,7 @@ database:
 redis:
   url: redis://localhost:6379/0
 gpu:
-  require_cuda: true
+  require_cuda: false
   device_id: 0
   half_precision: true
   cudnn_benchmark: true
@@ -91,10 +91,10 @@ gpu:
   calibration_samples: 30
   summary_seconds: 1
 delivery_filter:
-  min_track_frames: 10
-  min_track_frames_strict: 12
-  min_y_travel_ratio: 0.15
+  min_track_frames: 6
+  min_track_frames_strict: 8
+  min_y_travel_ratio: 0.08
   min_delivery_gap_sec: 0.80
-  min_new_detection_conf: 0.30
-  absurd_speed_kmh: 350
-  min_frames_between_markers: 18
+  min_new_detection_conf: 0.25
+  absurd_speed_kmh: 500
+  min_frames_between_markers: 14
