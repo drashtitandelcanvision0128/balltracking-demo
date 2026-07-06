@@ -81,46 +81,27 @@ def refine_bounce_world(
     lookback: int = 18,
 ) -> tuple[int, int] | None:
     """
-    Bounce = local minimum in world Y after the ball has traveled down the pitch.
-    Ignores early flight arcs from bowler-end cameras (not ground contact).
+    Bounce = local minimum in world Y (metres from stumps) after downward flight.
+    More stable than pixel-Y apex across camera angles.
     """
-    if len(raw_pts) < 8:
+    if len(raw_pts) < 5:
         return None
 
     start = max(0, len(raw_pts) - lookback)
     segment = raw_pts[start:]
     world = world_trajectory(segment, h_matrix)
-    if len(world) < 8:
+    if len(world) < 5:
         return None
 
-    start_y_m = world[0][1]
-    min_i = max(3, int(len(world) * 0.32))
-
     best_i, best_score = None, -1e9
-    for i in range(min_i, len(world) - 3):
+    for i in range(2, len(world) - 2):
         wy = [world[j][1] for j in range(i - 2, i + 3)]
+        # Bounce: world Y has local minimum (ball closest to batsman / lowest pitch point)
         if not (wy[1] > wy[2] and wy[3] > wy[2] and wy[0] > wy[2]):
             continue
-
-        bounce_y_m = wy[2]
-        if bounce_y_m < 2.8 or bounce_y_m > 17.0:
-            continue
-        if start_y_m - bounce_y_m < 3.5:
-            continue
-
-        px, py = segment[i]
-        if py < height * 0.22:
-            continue
-
         depth = (wy[1] - wy[2]) + (wy[3] - wy[2])
-        if depth < 0.15:
-            continue
-
-        has_risen = any(segment[j][1] < py - 5 for j in range(i + 1, len(segment)))
-        if not has_risen:
-            continue
-
-        score = depth * 10 - abs(wy[1] - wy[3])
+        flatness = abs(wy[1] - wy[3])
+        score = depth - flatness * 0.4
         if score > best_score:
             best_score = score
             best_i = i
@@ -128,6 +109,19 @@ def refine_bounce_world(
     if best_i is None:
         return None
     px, py = segment[best_i]
+    if py < height * 0.25:
+        return None
+
+    # Verify that the ball has actually risen (Y-coordinate decreased in pixels)
+    # in the subsequent frames to avoid false bounces while in the air.
+    has_risen = False
+    for j in range(best_i + 1, len(segment)):
+        if segment[j][1] < py - 2:
+            has_risen = True
+            break
+    if not has_risen:
+        return None
+
     return int(px), int(py)
 
 

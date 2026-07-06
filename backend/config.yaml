@@ -41,6 +41,8 @@ processing:
   clip_lost_sec: 1.15
   clip_scan_conf: 0.08
   clip_deep_imgsz: 1280
+  ball_approach_y_min: 0.48
+  ball_approach_y_min_after_contact: 0.28
   supported_formats:
   - .mp4
   - .avi

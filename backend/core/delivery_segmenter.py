@@ -11,6 +11,7 @@ import cv2
 
 from core.config import CONFIG
 from core.delivery_filter import can_start_new_delivery, min_gap_frames
+from core.ball_detection_filters import ball_candidate_ok
 
 _PROC = CONFIG.get("processing", {})
 CLIP_SCAN_STRIDE = int(_PROC.get("clip_scan_stride", 2))
@@ -73,11 +74,16 @@ def detect_ball_light(
         aspect = bw / (bh + 1e-5)
         if not (0.75 < aspect < 1.35):  # Ball is ROUND
             continue
+        cx = int((x1 + x2) / 2 * inv)
+        cy = int((y1 + y2) / 2 * inv)
+        ix1, iy1 = max(0, int(x1 * inv)), max(0, int(y1 * inv))
+        ix2, iy2 = min(width, int(x2 * inv)), min(height, int(y2 * inv))
+        roi = frame[iy1:iy2, ix1:ix2] if ix2 > ix1 and iy2 > iy1 else None
+        if not ball_candidate_ok(cx, cy, roi, height, width, frame):
+            continue
         conf = float(box.conf[0].item())
         if conf > best_conf:
             best_conf = conf
-            cx = int((x1 + x2) / 2 * inv)
-            cy = int((y1 + y2) / 2 * inv)
             best = (cx, cy, conf)
     return best
 

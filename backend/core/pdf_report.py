@@ -8,6 +8,10 @@ import os
 from datetime import datetime
 
 import cv2
+import matplotlib
+
+matplotlib.use("Agg")  # non-GUI backend — safe from Flask worker threads
+
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.backends.backend_pdf import PdfPages
@@ -166,4 +170,5 @@ def generate_session_pdf(
         pdf.savefig(fig, bbox_inches="tight")
         plt.close(fig)
 
+    plt.close("all")
     return output_path
