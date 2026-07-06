@@ -11,6 +11,7 @@ from core.config import CONFIG
 _PROC = CONFIG.get("processing", {})
 # Ball must reach this vertical band (toward batsman) before we lock a delivery — ignores flight in the air
 BALL_APPROACH_Y_MIN = float(_PROC.get("ball_approach_y_min", 0.42))
+BOUNCE_GROUND_Y_MIN = float(_PROC.get("bounce_ground_y_min", 0.65))
 
 
 def ball_roi_passes(roi) -> bool:
@@ -115,6 +116,11 @@ def in_batsman_approach_zone(cy: int, height: int, y_min_ratio: float | None = N
     """True when the ball is in the lower approach band near the batsman (not high in flight)."""
     threshold = BALL_APPROACH_Y_MIN if y_min_ratio is None else y_min_ratio
     return cy >= int(height * threshold)
+
+
+def in_bounce_ground_zone(cy: int, height: int) -> bool:
+    """True when the ball is low enough in frame to be on/near the pitch (not mid-air approach)."""
+    return cy >= int(height * BOUNCE_GROUND_Y_MIN)
 
 
 def allow_ball_detection(cy: int, height: int, *, post_contact: bool = False) -> bool:

@@ -41,8 +41,15 @@ processing:
   clip_lost_sec: 1.15
   clip_scan_conf: 0.08
   clip_deep_imgsz: 1280
-  ball_approach_y_min: 0.48
+  ball_approach_y_min: 0.55
   ball_approach_y_min_after_contact: 0.28
+  # Bounce near batsman — frame ke is % se neeche hona chahiye (long flight air reject)
+  bounce_ground_y_min: 0.65
+  bounce_min_track_frames: 10
+  bounce_lookback_frames: 40
+  bounce_min_descent_frames: 4
+  bounce_min_fall_ratio: 0.10
+  bounce_min_rise_px: 14
   supported_formats:
   - .mp4
   - .avi

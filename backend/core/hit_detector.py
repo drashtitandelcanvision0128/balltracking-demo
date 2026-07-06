@@ -88,6 +88,6 @@ def score_hit_enhanced(
     conf = min(1.0, conf + pose_bonus)
 
     # Pose proximity can confirm marginal hits
-    threshold = 0.38 if pose_bonus > 0.1 else 0.40
+    threshold = 0.34 if pose_bonus > 0.1 else 0.36
     is_hit = conf >= threshold
     return is_hit, conf, contact if is_hit else None
