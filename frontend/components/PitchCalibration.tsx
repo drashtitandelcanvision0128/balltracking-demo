@@ -128,7 +128,7 @@ export default function PitchCalibration({ videoUrl, onChange }: PitchCalibratio
         </div>
       </div>
       <p style={{ color: "#aaa", fontSize: 12, margin: "0 0 8px" }}>
-        Click 4 pitch corners in order: {CORNER_LABELS.join(" → ")}.
+        Click 4 pitch corners in order: {CORNER_LABELS.join(" → ")}. For best results, use the bowler end as the top-left corner and the batsman end as the bottom-left corner.
         {points.length < 4 && active ? ` (${points.length}/4)` : points.length === 4 ? " ✓ Done" : ""}
       </p>
       <div style={{ position: "relative", display: "inline-block", maxWidth: "100%" }}>

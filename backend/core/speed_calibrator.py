@@ -150,14 +150,20 @@ def compute_bowling_speed_kmh(
 
     # Calculate real-world distance in meters
     use_pixels = True
+    dist_m_homography = 0.0
+    dist_m = 0.0
     if h_matrix is not None:
         try:
             w0 = video_to_world(float(p0[0]), float(p0[1]), h_matrix)
             wn = video_to_world(float(pn[0]), float(pn[1]), h_matrix)
-            dist_m = math.hypot(wn[0] - w0[0], wn[1] - w0[1])
-            # If distance is too small or homography fails, fallback to pixel-based calculation
-            if dist_m > 1.0:
+            dist_m_homography = math.hypot(wn[0] - w0[0], wn[1] - w0[1])
+            
+            # Homography mapping for points in the air causes distortion.
+            # Only trust it if the resulting raw speed is physically realistic (< 180 km/h).
+            homography_speed = (dist_m_homography / dt) * 3.6
+            if dist_m_homography > 1.0 and homography_speed < 180.0:
                 use_pixels = False
+                dist_m = dist_m_homography
         except Exception:
             pass
 
@@ -166,6 +172,12 @@ def compute_bowling_speed_kmh(
         meters_per_px = 20.12 / pitch_span_px
         d_px = math.hypot(float(pn[0]) - float(p0[0]), float(pn[1]) - float(p0[1]))
         dist_m = d_px * meters_per_px
+
+        # If pixel fallback gives a very low speed but homography was available, blend them 
+        # to avoid returning unreasonably slow speeds due to weird camera angles.
+        pixel_speed = (dist_m / dt) * 3.6
+        if dist_m_homography > 0 and pixel_speed < 60.0:
+            dist_m = (dist_m + dist_m_homography) / 2.0
 
     # Calculate average speed in km/h
     avg_speed_kmh = (dist_m / dt) * 3.6

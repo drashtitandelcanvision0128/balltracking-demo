@@ -34,19 +34,22 @@ from pitch_map_renderer import (
     PITCH_L, PITCH_R, PITCH_TOP, PITCH_BOT,
 )
 from accuracy_engine import (
-    refine_bounce_point, classify_boundary, classify_miss, snap_to_pitch, find_hist_index_near,
+    refine_bounce_point, confirm_pitch_bounce, classify_boundary, classify_miss, snap_to_pitch, find_hist_index_near,
 )
 from core.pitch_calibrator import calibrate_pitch_robust
 from core.trajectory_physics import refine_bounce_world, interpolate_track_gaps
 from core.hit_detector import score_hit_enhanced
 from core.config import CONFIG
-from core.pitch_coords import pitchmap_to_world
+from core.pitch_coords import pitchmap_to_world, video_to_pitchmap
 from core.classifier import classify_bounce
 from core.gpu_runtime import init_gpu_runtime, load_yolo_model, infer_settings, ffmpeg_encode_args
 from core.pose_estimator import BatsmanPoseEstimator
 from core.delivery_filter import (
     can_start_new_delivery, should_register_marker, is_valid_delivery_track,
     MIN_NEW_DET_CONF, min_gap_frames,
+)
+from core.ball_detection_filters import (
+    ball_candidate_ok, allow_ball_detection, in_batsman_approach_zone, in_bounce_ground_zone,
 )
 from core.delivery_segmenter import segment_deliveries
 from core.speed_calibrator import compute_bowling_speed_kmh, session_speed_stats
@@ -73,8 +76,14 @@ CALIB_SAMPLES = int(_GPU_CFG.get('calibration_samples', 15))
 _VIZ = CONFIG.get('visualization', {})
 SHOW_CORNER_PITCH_MAP = bool(_VIZ.get('show_corner_pitch_map', False))
 SHOW_SUMMARY_PITCH_MAP = bool(_VIZ.get('show_summary_pitch_map', False))
-SHOW_PITCH_ZONE_OVERLAY = bool(_VIZ.get('show_pitch_zone_overlay', True))
+SHOW_PITCH_ZONE_OVERLAY = bool(_VIZ.get('show_pitch_zone_overlay', False))
 _PROC = CONFIG.get('processing', {})
+BOUNCE_GROUND_Y_MIN = float(_PROC.get('bounce_ground_y_min', 0.65))
+BOUNCE_MIN_TRACK_FRAMES = int(_PROC.get('bounce_min_track_frames', 10))
+BOUNCE_LOOKBACK_FRAMES = int(_PROC.get('bounce_lookback_frames', 40))
+BOUNCE_MIN_DESCENT_FRAMES = int(_PROC.get('bounce_min_descent_frames', 4))
+BOUNCE_MIN_FALL_RATIO = float(_PROC.get('bounce_min_fall_ratio', 0.10))
+BOUNCE_MIN_RISE_PX = float(_PROC.get('bounce_min_rise_px', 14))
 CLIP_BY_CLIP = bool(_PROC.get('clip_by_clip', False))
 CLIP_MODE = str(_PROC.get('clip_mode', 'stream'))  # stream | clip
 STREAM_DETECT_EVERY_FRAME = bool(_PROC.get('stream_detect_every_frame', True))
@@ -274,23 +283,96 @@ def draw_ball_stats_panels(frame, stats):
         draw_ui_panel(frame, 'OUT', str(stats['wickets']), (345, 75), size=(100, 48), value_color=(200, 200, 255))
 
 
+def _hud_play_status(event_status, *, hit_occurred=False, bounces=None, frame_index=0, clips=None):
+    """Batsman played the ball → Hit / Miss / Waiting (new ball in progress)."""
+    if hit_occurred or event_status == 'POST_HIT':
+        return 'Hit', (0, 255, 128)
+    if event_status == 'MISS':
+        return 'Miss', (0, 80, 255)
+    # New ball approaching or outcome not yet decided
+    if event_status in ('WAITING', 'BOWLED'):
+        return 'Waiting', (0, 200, 255)
+
+    # Clip render pass — outcome only after it is registered for this clip
+    if bounces and clips:
+        for clip in clips:
+            if clip.start <= frame_index <= clip.end:
+                clip_bounces = [
+                    b for b in bounces
+                    if clip.start <= b.get('frame', 0) <= frame_index
+                ]
+                if clip_bounces:
+                    last = clip_bounces[-1]
+                    settled = frame_index > last.get('frame', 0) + 5
+                    if settled and last.get('hit') is True:
+                        return 'Hit', (0, 255, 128)
+                    if settled and last.get('hit') is False:
+                        return 'Miss', (0, 80, 255)
+                return 'Waiting', (0, 200, 255)
+
+    return 'Waiting', (0, 200, 255)
+
+
+def _hud_balls_delivered(stats, event_status):
+    """Total balls faced — include the delivery currently in flight."""
+    total = stats['total']
+    if event_status == 'BOWLED':
+        return total + 1
+    return total
+
+
+def draw_batsman_stats_hud(frame, event_status, stats, fps, *, hit_occurred=False,
+                           frame_index=0, clips=None, bounces=None):
+    """Compact top HUD: hit/miss, balls delivered, video FPS."""
+    x, y = 10, 8
+    box_w, line_h = 310, 18
+    pad_x, pad_y = 10, 8
+    box_h = pad_y * 2 + line_h * 3 + 4
+
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (x, y), (x + box_w, y + box_h), (12, 12, 12), -1)
+    cv2.rectangle(overlay, (x, y), (x + box_w, y + box_h), (180, 180, 180), 1)
+    cv2.addWeighted(overlay, 0.72, frame, 0.28, 0, frame)
+
+    play_text, play_color = _hud_play_status(
+        event_status, hit_occurred=hit_occurred,
+        bounces=bounces, frame_index=frame_index, clips=clips,
+    )
+    balls = _hud_balls_delivered(stats, event_status)
+    fps_text = f'{int(fps)}' if fps >= 100 else (f'{fps:.1f}' if abs(fps - round(fps)) > 0.05 else f'{int(fps)}')
+
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    fs, th = 0.45, 1
+    ty = y + pad_y + 14
+    cv2.putText(frame, f'Batsman Played ball: {play_text}', (x + pad_x, ty),
+                font, fs, play_color, th, cv2.LINE_AA)
+    cv2.putText(frame, f'Batsman Ball delivered: {balls}', (x + pad_x, ty + line_h + 2),
+                font, fs, (220, 220, 220), th, cv2.LINE_AA)
+    cv2.putText(frame, f'FPS: {fps_text}', (x + pad_x, ty + 2 * (line_h + 2)),
+                font, fs, (180, 220, 255), th, cv2.LINE_AA)
+
+
 def _estimate_landing_point(raw_pts, height):
-    """Best guess of where the ball finished — bounce apex or lowest tracked point."""
+    """Pitch bounce from real detections only — no air fallbacks."""
     if not raw_pts:
         return None
-    bounce = refine_bounce_point(raw_pts, height, lookback=len(raw_pts))
-    if bounce is not None:
-        return bounce
-    if len(raw_pts) >= 3:
-        for i in range(1, len(raw_pts) - 1):
-            dy_before = raw_pts[i][1] - raw_pts[i - 1][1]
-            dy_after = raw_pts[i + 1][1] - raw_pts[i][1]
-            if dy_before > 0.8 and dy_after < -0.8:
-                return raw_pts[i]
-    lower = [p for p in raw_pts if p[1] > height * 0.30]
-    if lower:
-        return max(lower, key=lambda p: p[1])
-    return raw_pts[-1]
+    return confirm_pitch_bounce(
+        raw_pts, height,
+        ground_y_ratio=BOUNCE_GROUND_Y_MIN,
+        lookback=min(len(raw_pts), BOUNCE_LOOKBACK_FRAMES),
+        min_descent=BOUNCE_MIN_DESCENT_FRAMES,
+        min_fall_ratio=BOUNCE_MIN_FALL_RATIO,
+        min_rise_px=BOUNCE_MIN_RISE_PX,
+    )
+
+
+def _bounce_confirm_kwargs():
+    return dict(
+        ground_y_ratio=BOUNCE_GROUND_Y_MIN,
+        min_descent=BOUNCE_MIN_DESCENT_FRAMES,
+        min_fall_ratio=BOUNCE_MIN_FALL_RATIO,
+        min_rise_px=BOUNCE_MIN_RISE_PX,
+    )
 
 
 def _register_dot_from_track(raw_pts, height, h_matrix, frame_index, job_bounces,
@@ -303,8 +385,8 @@ def _register_dot_from_track(raw_pts, height, h_matrix, frame_index, job_bounces
     if landing is None:
         return last_marker_frame, False
     bx, by = landing
-    # Reject fallback landing points that are too high up in the frame (still in the air)
-    if by < height * 0.45:
+    # Reject fallback landing points that are still in the air (above pitch bounce band)
+    if not in_bounce_ground_zone(by, height):
         return last_marker_frame, False
     speed = _compute_delivery_speed(raw_pts, fps, height, h_matrix)
     result = _add_delivery_marker(
@@ -339,12 +421,14 @@ def _add_delivery_marker(bx, by, h_matrix, label, frame_index,
                          job_bounces, session_bounces, persistent_video_bounces,
                          speed_kmh=0.0, detection_conf=0.9, tracking_conf=0.9,
                          full_toss=False, pose_data=None, raw_pts=None, height=0, fps=25.0,
-                         last_marker_frame=0, strict=False):
-    """Register one delivery outcome — skipped if track fails validation."""
-    if raw_pts is not None and not should_register_marker(
-            raw_pts, height, fps, frame_index, last_marker_frame, strict=strict):
-        print(f"[Frame {frame_index}] SKIP marker — invalid/false track")
-        return None, last_marker_frame
+                         last_marker_frame=0, strict=False, hit=False):
+    """Register one delivery outcome — bounces already validated by _try_detect_bounce."""
+    # Skip extra validation since _try_detect_bounce() already did strict checks
+    # if raw_pts is not None and not should_register_marker(
+    #         raw_pts, height, fps, frame_index, last_marker_frame, strict=strict):
+    #     print(f"[Frame {frame_index}] SKIP marker — invalid/false track")
+    #     return None, last_marker_frame
+    
     px_map, py_map = transform_to_pitchmap(bx, by, h_matrix)
     px_map, py_map = snap_to_pitch(px_map, py_map, PITCH_L, PITCH_R, PITCH_TOP, PITCH_BOT)
     x_m, y_m = pitchmap_to_world(px_map, py_map)
@@ -372,6 +456,7 @@ def _add_delivery_marker(bx, by, h_matrix, label, frame_index,
         'pitch_map_x': px_map,
         'pitch_map_y': py_map,
         'pose_data': pose_data,
+        'hit': hit,
     }
     job_bounces.append(bounce_entry)
     session_bounces.append({
@@ -380,22 +465,97 @@ def _add_delivery_marker(bx, by, h_matrix, label, frame_index,
         'line_type': classification.line_type,
         'bounce_x': classification.bounce_x, 'bounce_y': classification.bounce_y,
         'speed_kmh': speed_kmh,
+        'hit': hit,
     })
     persistent_video_bounces.append({
         'coords': (int(bx), int(by)), 'label': label, 'length': length_zone,
         'length_type': classification.length_type, 'line_type': classification.line_type,
         'speed_kmh': speed_kmh,
+        'hit': hit,
     })
     return length_zone, frame_index
 
 
-def _relable_last_bounce(job_bounces, session_bounces, persistent_video_bounces, label):
+def _relocate_last_bounce_coords(bx, by, h_matrix, frame_index, job_bounces, session_bounces,
+                                 persistent_video_bounces, label=None):
+    """Move the last bounce marker when a deeper pitch contact is confirmed later."""
+    if not persistent_video_bounces:
+        return False
+    old_bx, old_by = persistent_video_bounces[-1]['coords']
+    if by < old_by + 12:
+        return False
+    label = label or persistent_video_bounces[-1].get('label', 'DOTS')
+    px_map, py_map = transform_to_pitchmap(bx, by, h_matrix)
+    px_map, py_map = snap_to_pitch(px_map, py_map, PITCH_L, PITCH_R, PITCH_TOP, PITCH_BOT)
+    x_m, y_m = pitchmap_to_world(px_map, py_map)
+    classification = classify_bounce(x_m, y_m)
+    length_zone = classification.length_legacy
+    persistent_video_bounces[-1].update({
+        'coords': (int(bx), int(by)),
+        'label': label,
+        'length': length_zone,
+        'length_type': classification.length_type,
+        'line_type': classification.line_type,
+    })
+    if job_bounces:
+        job_bounces[-1].update({
+            'coords': (px_map, py_map),
+            'length': length_zone,
+            'length_type': classification.length_type,
+            'line_type': classification.line_type,
+            'bounce_x': classification.bounce_x,
+            'bounce_y': classification.bounce_y,
+            'frame': frame_index,
+            'pitch_map_x': px_map,
+            'pitch_map_y': py_map,
+        })
+    if session_bounces:
+        session_bounces[-1].update({
+            'coords': (px_map, py_map),
+            'length': length_zone,
+            'length_type': classification.length_type,
+            'line_type': classification.line_type,
+            'bounce_x': classification.bounce_x,
+            'bounce_y': classification.bounce_y,
+        })
+    print(f"[Bounce] RELOCATED to ({bx:.0f}, {by:.0f}) | was ({old_bx}, {old_by})")
+    return True
+
+
+def _try_refine_bounce_marker(det_pts, height, h_matrix, frame_index, job_bounces, session_bounces,
+                              persistent_video_bounces, bounced_this_delivery, hit_occurred,
+                              frames_since_bounce, fps):
+    """Long-flight deliveries: shift marker down if ball bounces later near batsman."""
+    if not bounced_this_delivery or hit_occurred:
+        return
+    if frames_since_bounce > max(12, int(fps * 0.55)):
+        return
+    if len(det_pts) < BOUNCE_MIN_TRACK_FRAMES:
+        return
+    lookback = min(len(det_pts), BOUNCE_LOOKBACK_FRAMES)
+    bounce_pt = confirm_pitch_bounce(det_pts, height, lookback=lookback, **_bounce_confirm_kwargs())
+    if bounce_pt is None:
+        return
+    bx, by = bounce_pt
+    if not in_bounce_ground_zone(by, height):
+        return
+    _relocate_last_bounce_coords(
+        bx, by, h_matrix, frame_index, job_bounces, session_bounces,
+        persistent_video_bounces)
+
+
+def _relable_last_bounce(job_bounces, session_bounces, persistent_video_bounces, label, hit=None):
+    if hit is None:
+        hit = label in ('RUNS', 'BOUNDARIES')
     if session_bounces:
         session_bounces[-1]['type'] = label
+        session_bounces[-1]['hit'] = hit
     if job_bounces:
         job_bounces[-1]['type'] = label
+        job_bounces[-1]['hit'] = hit
     if persistent_video_bounces:
         persistent_video_bounces[-1]['label'] = label
+        persistent_video_bounces[-1]['hit'] = hit
 
 
 def _close_delivery(raw_pts, height, h_matrix, frame_index, hit_occurred, event_status,
@@ -412,13 +572,13 @@ def _close_delivery(raw_pts, height, h_matrix, frame_index, hit_occurred, event_
         return last_marker_frame
 
     bx, by = landing
-    # Reject fallback landing points that are too high up in the frame (still in the air)
-    if by < height * 0.45:
+    # Reject fallback landing points that are still in the air (above pitch bounce band)
+    if not in_bounce_ground_zone(by, height):
         return last_marker_frame
 
     label = 'DOTS'
     if hit_occurred:
-        label = 'RUNS' if post_hit_max_speed >= 20.0 else 'DOTS'
+        label = 'RUNS' if post_hit_max_speed >= 8.0 else 'DOTS'
         if label == 'RUNS' and post_hit_max_speed > 38.0:
             label = 'BOUNDARIES'
     if event_status == 'MISS':
@@ -429,7 +589,7 @@ def _close_delivery(raw_pts, height, h_matrix, frame_index, hit_occurred, event_
         bx, by, h_matrix, label, frame_index,
         job_bounces, session_bounces, persistent_video_bounces, speed_kmh=speed,
         raw_pts=raw_pts, height=height, fps=fps, last_marker_frame=last_marker_frame,
-        strict=False)
+        strict=False, hit=hit_occurred)
     if result[0] is not None:
         zone = result[0]
         print(f"[Frame {frame_index}] DELIVERY closed @ ({bx},{by}) | {label} | {zone} | {speed:.0f} km/h")
@@ -437,32 +597,52 @@ def _close_delivery(raw_pts, height, h_matrix, frame_index, hit_occurred, event_
     return last_marker_frame
 
 
+def _resolve_batsman_miss(raw_pts, hist, height, hit_occurred, bounced, y_max_val):
+    """True when ball passed the batsman without bat contact."""
+    if hit_occurred or not bounced:
+        return False
+    pts = hist if hist and len(hist) >= 4 else raw_pts
+    if len(pts) < 4:
+        return False
+    return classify_miss(pts, height, hit_occurred, bounced, batsman_y_max=y_max_val)
+
+
 def _finalize_delivery(raw_pts, height, h_matrix, frame_index, hit_occurred, event_status,
                        bounced_this_delivery, job_bounces, session_bounces,
                        persistent_video_bounces, fps, last_marker_frame, last_detection_conf=0.5,
-                       post_hit_max_speed=0.0):
+                       post_hit_max_speed=0.0, hist_pts=None, y_max_val=0.92, det_pts=None):
     """
     End one delivery — register DOT if no bounce yet, then close.
     Ensures every tracked ball gets a RUN or DOT marker when possible.
     """
+    bounce_pts = list(det_pts) if det_pts is not None else list(raw_pts)
     bounced = bounced_this_delivery
-    if not bounced and not hit_occurred and len(raw_pts) >= 3:
+    if not hit_occurred and _resolve_batsman_miss(
+            raw_pts, hist_pts, height, hit_occurred, bounced, y_max_val):
+        event_status = 'MISS'
+        if bounced and persistent_video_bounces:
+            _relable_last_bounce(job_bounces, session_bounces, persistent_video_bounces,
+                                 'WICKETS', hit=False)
+
+    if not bounced and not hit_occurred and len(bounce_pts) >= BOUNCE_MIN_TRACK_FRAMES:
         last_marker_frame, registered = _register_dot_from_track(
-            raw_pts, height, h_matrix, frame_index, job_bounces, session_bounces,
+            bounce_pts, height, h_matrix, frame_index, job_bounces, session_bounces,
             persistent_video_bounces, fps, last_marker_frame, last_detection_conf)
         if registered:
             bounced = True
     last_marker_frame = _close_delivery(
-        raw_pts, height, h_matrix, frame_index, hit_occurred, event_status, bounced,
+        bounce_pts, height, h_matrix, frame_index, hit_occurred, event_status, bounced,
         job_bounces, session_bounces, persistent_video_bounces,
         fps=fps, last_marker_frame=last_marker_frame, post_hit_max_speed=post_hit_max_speed)
     return last_marker_frame
 
 
-def _reset_delivery_state(kf, dt, history, raw_history):
+def _reset_delivery_state(kf, dt, history, raw_history, det_history=None):
     """Clear per-delivery trackers for the next ball."""
     history.clear()
     raw_history.clear()
+    if det_history is not None:
+        det_history.clear()
     kf_new = BallKalmanFilter(dt=dt)
     return kf_new, {
         'hit_occurred': False,
@@ -479,48 +659,94 @@ def _reset_delivery_state(kf, dt, history, raw_history):
 
 
 def _refine_bounce(raw_pts, height, h_matrix):
-    """World-coords bounce with pixel-Y fallback."""
-    if h_matrix is not None:
-        pt = refine_bounce_world(raw_pts, h_matrix, height)
-        if pt is not None:
-            return pt
-    return refine_bounce_point(raw_pts, height)
+    """
+    Finds the exact bounce point by measuring the trajectory's 'sag' due to gravity.
+    The bounce is the point furthest below a straight line drawn from release to the current frame.
+    """
+    if len(raw_pts) < 5:
+        return None
+    
+    # Ignore the first few frames to ensure we are past the bowler's hand release
+    segment = raw_pts[3:]
+    if len(segment) < 3:
+        return None
+        
+    x1, y1 = segment[0]
+    x2, y2 = segment[-1]
+    n = len(segment)
+    
+    max_dist = -float('inf')
+    best_p = None
+    
+    for i in range(1, n - 1):
+        p = segment[i]
+        # Interpolate Y on a straight line connecting the start and end of the segment
+        line_y = y1 + (i / (n - 1)) * (y2 - y1)
+        # Calculate how far 'below' (higher Y in pixels) the actual ball is from the straight path
+        dist = p[1] - line_y
+        
+        if dist > max_dist:
+            max_dist = dist
+            best_p = p
+            
+    # Require at least a small amount of curvature to confirm a real bounce
+    if best_p is not None and max_dist > 2.0:
+        return best_p
+        
+    return None
 
 
 def _try_detect_bounce(raw_pts, frame_index, last_bounce_frame, fps, h_matrix, persistent_video_bounces, height, width=0):
-    """Pitch bounce — apex in trajectory, filtered to pitch area."""
-    if len(raw_pts) < 5:
+    """
+    Register bounce only on real YOLO detections: deepest track point after descent,
+    then confirmed rise — not Kalman coast / mid-air points.
+    """
+    min_pts = max(8, BOUNCE_MIN_TRACK_FRAMES)
+    if len(raw_pts) < min_pts:
         return None
     if frame_index - last_bounce_frame <= max(6, int(fps * 0.25)):
         return None
 
-    filled = interpolate_track_gaps(raw_pts, fps)
-    bounce_pt = _refine_bounce(filled, height, h_matrix)
+    lookback = min(len(raw_pts), BOUNCE_LOOKBACK_FRAMES)
+    bounce_pt = confirm_pitch_bounce(raw_pts, height, lookback=lookback, **_bounce_confirm_kwargs())
     if bounce_pt is None:
         return None
+
     bx, by = bounce_pt
-    if by < height * 0.43:
-        return None
-    near_tail = min(math.hypot(bx - p[0], by - p[1]) for p in raw_pts[-8:])
-    if near_tail > 45:
+    if not in_bounce_ground_zone(by, height):
+        print(f"[Bounce] REJECTED: Still in air (by={by:.0f}, need>={height * BOUNCE_GROUND_Y_MIN:.0f})")
         return None
 
-    on_pitch = is_on_pitch(bx, by, h_matrix, margin=50)
-    if not on_pitch and width > 0:
-        # Fallback: lower-middle corridor on video when homography is imperfect
-        in_corridor = (width * 0.15 < bx < width * 0.85 and height * 0.43 < by < height * 0.88)
+    seg = raw_pts[-lookback:]
+    if by < max(p[1] for p in seg) - 4:
+        print(f"[Bounce] REJECTED: Not at track bottom yet (by={by:.0f})")
+        return None
 
-        
-        if not in_corridor:
+    y_span = max(p[1] for p in raw_pts) - min(p[1] for p in raw_pts)
+    if y_span < height * 0.06:
+        print(f"[Bounce] REJECTED: Insufficient vertical travel (span={y_span:.0f}px)")
+        return None
+
+    print(f"[Bounce] Confirmed pitch contact at ({bx:.0f}, {by:.0f}), height={height}")
+
+    if not (height * BOUNCE_GROUND_Y_MIN <= by < height * 0.88):
+        print(f"[Bounce] REJECTED: Outside vertical zone (by={by:.0f})")
+        return None
+
+    if h_matrix is not None:
+        px, py = video_to_pitchmap(bx, by, h_matrix)
+        print(f"[Bounce] Pitchmap: ({px:.1f}, {py:.1f})")
+        if not (150 <= py <= 700):
+            print(f"[Bounce] REJECTED: Outside pitch (py={py:.1f})")
             return None
-    elif not on_pitch:
-        return None
 
-    too_close = any(
-        math.hypot(bx - b['coords'][0], by - b['coords'][1]) < 22
-        for b in persistent_video_bounces)
-    if too_close:
-        return None
+    if persistent_video_bounces:
+        min_dist = min(math.hypot(bx - b['coords'][0], by - b['coords'][1]) for b in persistent_video_bounces)
+        if min_dist < 25:
+            print(f"[Bounce] REJECTED: Duplicate (dist={min_dist:.0f})")
+            return None
+
+    print(f"[Bounce] ACCEPTED @ ({bx:.0f}, {by:.0f})")
     return (bx, by)
 
 
@@ -600,9 +826,10 @@ def _synthetic_clips_from_bounces(bounce_events: list[dict], total_frames: int, 
         })
     return clips
 
+
 def _yolo_detect_ball(model, frame, width, height, conf_thresh, detect_imgsz, infer_scale_run,
                       use_half, yolo_device, kf=None, frames_since_det=0, coast_limit=18,
-                      last_velocity=0.0, raw_history=None):
+                      last_velocity=0.0, raw_history=None, post_contact=False):
     """YOLO ball detection with optional Kalman proximity scoring."""
     best_coords = None
     best_score = -float('inf')
@@ -626,12 +853,19 @@ def _yolo_detect_ball(model, frame, width, height, conf_thresh, detect_imgsz, in
         x1, y1, x2, y2 = box.xyxy[0].tolist()
         bw, bh = (x2 - x1) * inv, (y2 - y1) * inv
         area = bw * bh
-        if area < 12 or area > 1600:
+        if area < 25 or area > 550:  # Tighter size range for actual ball
             continue
         aspect = bw / (bh + 1e-5)
-        if not (0.3 < aspect < 3.0):
+        if not (0.75 < aspect < 1.35):  # Ball is ROUND (not elongated like bat)
             continue
+
+        ix1, iy1 = max(0, int(x1 * inv)), max(0, int(y1 * inv))
+        ix2, iy2 = min(width, int(x2 * inv)), min(height, int(y2 * inv))
         cx, cy = int((x1 + x2) / 2 * inv), int((y1 + y2) / 2 * inv)
+        roi = frame[iy1:iy2, ix1:ix2] if ix2 > ix1 and iy2 > iy1 else None
+        if not ball_candidate_ok(cx, cy, roi, height, width, frame, post_contact=post_contact):
+            continue
+        
         score = float(box.conf[0].item())
         if kf is not None and kf.initialized and frames_since_det <= coast_limit:
             px, py = kf.get_position()
@@ -640,12 +874,11 @@ def _yolo_detect_ball(model, frame, width, height, conf_thresh, detect_imgsz, in
             speed_est = max(last_velocity, math.hypot(vx, vy), 30.0)
             # Dynamic search radius based on vertical zone to optimize tracking stability:
             if py > height * 0.52:
-                # In batting zone: tight search area when tracking is active to avoid batsman/pads,
-                # but expand if tracking is lost to capture deflections.
-                max_dist = 130 if frames_since_det == 0 else max(380, speed_est * frames_since_det * 4.5)
+                # In batting zone: slightly wider search area so post-hit or occluded balls are not dropped.
+                max_dist = 160 if frames_since_det == 0 else max(420, speed_est * frames_since_det * 4.8)
             else:
                 # In the air / bowling zone: generous search area to prevent early tracking loss.
-                max_dist = max(280, speed_est * frames_since_det * 4.0)
+                max_dist = max(320, speed_est * frames_since_det * 4.2)
             if dist > max_dist:
                 continue
 
@@ -654,11 +887,11 @@ def _yolo_detect_ball(model, frame, width, height, conf_thresh, detect_imgsz, in
             step_from_last = math.hypot(cx - lx, cy - ly)
             if py > height * 0.52 and last_velocity > 15.0:
                 if step_from_last < 10.0:
-                    score -= 0.50  # Heavy penalty to prevent locking onto static batsman/pad/bat
+                    score -= 0.30  # Softer penalty to avoid dropping a real ball when it is briefly occluded.
                 else:
-                    score -= dist * 0.001  # Reduced penalty for moving candidates to allow post-hit re-acquisition
+                    score -= dist * 0.0008
             else:
-                score -= dist * 0.003
+                score -= dist * 0.0022
         if score > best_score:
             best_score = score
             best_coords = (cx, cy)
@@ -683,6 +916,7 @@ def track_delivery_clip(cap, clip, model, fps, width, height, h_matrix, dt,
     kf = BallKalmanFilter(dt=dt)
     history = SmoothHistory(maxlen=200, smooth_window=3)
     raw_history = deque(maxlen=200)
+    det_history = deque(maxlen=200)
     frames_since_det = 999
     last_velocity = 0.0
     event_status = "BOWLED"
@@ -714,6 +948,7 @@ def track_delivery_clip(cap, clip, model, fps, width, height, h_matrix, dt,
                 use_half, yolo_device, kf=kf, frames_since_det=frames_since_det,
                 coast_limit=coast_limit, last_velocity=last_velocity,
                 raw_history=raw_history,
+                post_contact=bounced_this_delivery or hit_occurred,
             )
 
         if best_coords is not None:
@@ -735,6 +970,7 @@ def track_delivery_clip(cap, clip, model, fps, width, height, h_matrix, dt,
                 if step > jump_limit and gap_frames <= int(fps * 0.30):
                     history.clear()
                     raw_history.clear()
+                    det_history.clear()
                     kf = BallKalmanFilter(dt=dt)
                     kf.init(cx, cy)
                     hit_occurred = False
@@ -746,20 +982,23 @@ def track_delivery_clip(cap, clip, model, fps, width, height, h_matrix, dt,
 
             history.add((cx, cy))
             raw_history.append((cx, cy))
+            det_history.append((cx, cy))
             frames_since_det = 0
         elif kf.initialized and frames_since_det <= coast_limit:
             kf.predict()
             px, py = kf.get_position()
-            best_coords = (px, py)
-            is_predicted = True
-            history.add((px, py))
-            raw_history.append((px, py))
-            vx, vy = kf.get_velocity()
-            last_velocity = max(last_velocity, math.hypot(vx, vy))
+            if allow_ball_detection(py, height, post_contact=bounced_this_delivery or hit_occurred):
+                best_coords = (px, py)
+                is_predicted = True
+                history.add((px, py))
+                raw_history.append((px, py))
+                vx, vy = kf.get_velocity()
+                last_velocity = max(last_velocity, math.hypot(vx, vy))
         elif kf.initialized:
             kf.predict()
 
         raw_list = interpolate_track_gaps(list(raw_history), fps)
+        det_list = list(det_history)
         hist = history.get_list()
 
         pose_samples = None
@@ -779,7 +1018,7 @@ def track_delivery_clip(cap, clip, model, fps, width, height, h_matrix, dt,
 
         if event_status == "BOWLED" and not bounced_this_delivery and not hit_occurred:
             bounce_pt = _try_detect_bounce(
-                raw_list, frame_index, last_bounce_frame, fps, h_matrix,
+                det_list, frame_index, last_bounce_frame, fps, h_matrix,
                 persistent_video_bounces, height, width=width)
             if bounce_pt is not None:
                 bx, by = bounce_pt
@@ -796,15 +1035,21 @@ def track_delivery_clip(cap, clip, model, fps, width, height, h_matrix, dt,
                     speed_kmh=speed, detection_conf=last_detection_conf,
                     tracking_conf=tracking_conf, pose_data=pose_samples or None,
                     raw_pts=raw_list, height=height, fps=fps,
-                    last_marker_frame=last_marker_frame, strict=False)
+                    last_marker_frame=last_marker_frame, strict=False, hit=False)
                 if result[0] is not None:
                     last_marker_frame = result[1]
                     last_bounce_frame = frame_index
                     print(f"[Clip {clip.start}-{clip.end}] BOUNCE @ frame {frame_index} | {result[0]} | {speed:.0f} km/h")
                 else:
                     bounced_this_delivery = False
+        elif bounced_this_delivery and not hit_occurred:
+            _try_refine_bounce_marker(
+                det_list, height, h_matrix, frame_index, job_bounces, session_bounces,
+                persistent_video_bounces, bounced_this_delivery, hit_occurred,
+                frames_since_bounce, fps)
 
-        if event_status in ("BOWLED", "MISS") and not hit_occurred:
+        ball_near_batsman = bool(hist) and in_batsman_approach_zone(hist[-1][1], height)
+        if ball_near_batsman and event_status in ("BOWLED", "MISS") and not hit_occurred:
             is_hit, hit_conf, contact = score_hit_enhanced(
                 raw_list, hist, height, fps, bounced_this_delivery, frames_since_bounce,
                 bounce_hist_idx=bounce_hist_idx, pose_frames=pose_samples)
@@ -813,9 +1058,9 @@ def track_delivery_clip(cap, clip, model, fps, width, height, h_matrix, dt,
                 event_status = "POST_HIT"
                 pre_hit_speed = math.hypot(hist[-2][0] - hist[-3][0], hist[-2][1] - hist[-3][1]) if len(hist) >= 3 else 0.0
                 post_hit_max_speed = math.hypot(hist[-1][0] - hist[-2][0], hist[-1][1] - hist[-2][1])
-                initial_label = 'RUNS' if post_hit_max_speed >= 20.0 else 'DOTS'
+                initial_label = 'RUNS' if post_hit_max_speed >= 8.0 else 'DOTS'
                 if bounced_this_delivery and job_bounces:
-                    _relable_last_bounce(job_bounces, session_bounces, persistent_video_bounces, initial_label)
+                    _relable_last_bounce(job_bounces, session_bounces, persistent_video_bounces, initial_label, hit=True)
                 else:
                     hp = contact or (hist[-3] if len(hist) >= 3 else hist[-1])
                     speed = _compute_delivery_speed(raw_list, fps, height, h_matrix)
@@ -823,7 +1068,7 @@ def track_delivery_clip(cap, clip, model, fps, width, height, h_matrix, dt,
                         hp[0], hp[1], h_matrix, initial_label, frame_index,
                         job_bounces, session_bounces, persistent_video_bounces,
                         speed_kmh=speed, raw_pts=raw_list, height=height, fps=fps,
-                        last_marker_frame=last_marker_frame, strict=False)
+                        last_marker_frame=last_marker_frame, strict=False, hit=True)
                     if result[0] is not None:
                         last_marker_frame = result[1]
                         bounced_this_delivery = True
@@ -832,26 +1077,29 @@ def track_delivery_clip(cap, clip, model, fps, width, height, h_matrix, dt,
         if event_status == "POST_HIT" and len(hist) >= 2:
             speed = math.hypot(hist[-1][0] - hist[-2][0], hist[-1][1] - hist[-2][1])
             post_hit_max_speed = max(post_hit_max_speed, speed)
-            label = 'RUNS' if post_hit_max_speed >= 20.0 else 'DOTS'
+            label = 'RUNS' if post_hit_max_speed >= 8.0 else 'DOTS'
             if classify_boundary(hist, post_hit_max_speed, height, pre_hit_speed):
                 label = 'BOUNDARIES'
             if persistent_video_bounces and persistent_video_bounces[-1]['label'] in ('DOTS', 'RUNS', 'BOUNDARIES'):
-                _relable_last_bounce(job_bounces, session_bounces, persistent_video_bounces, label)
+                _relable_last_bounce(job_bounces, session_bounces, persistent_video_bounces, label, hit=True)
 
-        if event_status == "BOWLED" and bounced_this_delivery and classify_miss(hist, height, hit_occurred, bounced_this_delivery, batsman_y_max=y_max_val):
-            event_status = "MISS"
-            _relable_last_bounce(job_bounces, session_bounces, persistent_video_bounces, 'WICKETS')
+        if event_status == "BOWLED" and bounced_this_delivery:
+            miss_ready = frames_since_bounce >= max(6, int(fps * 0.10))
+            if miss_ready and not hit_occurred and classify_miss(
+                    hist, height, hit_occurred, bounced_this_delivery, batsman_y_max=y_max_val):
+                event_status = "MISS"
+                _relable_last_bounce(job_bounces, session_bounces, persistent_video_bounces, 'WICKETS', hit=False)
 
-    if not bounced_this_delivery and not hit_occurred and len(raw_history) >= 4:
+    if not bounced_this_delivery and not hit_occurred and len(det_history) >= BOUNCE_MIN_TRACK_FRAMES:
         last_marker_frame, registered = _register_dot_from_track(
-            list(raw_history), height, h_matrix, min(frame_index, clip.end),
+            list(det_history), height, h_matrix, min(frame_index, clip.end),
             job_bounces, session_bounces, persistent_video_bounces, fps,
             last_marker_frame, last_detection_conf)
         if registered:
             bounced_this_delivery = True
 
     last_marker_frame = _close_delivery(
-        list(raw_history), height, h_matrix, min(frame_index, clip.end),
+        list(det_history), height, h_matrix, min(frame_index, clip.end),
         hit_occurred, event_status, bounced_this_delivery,
         job_bounces, session_bounces, persistent_video_bounces,
         fps=fps, last_marker_frame=last_marker_frame, post_hit_max_speed=post_hit_max_speed)
@@ -870,6 +1118,7 @@ def track_delivery_clip(cap, clip, model, fps, width, height, h_matrix, dt,
         'outcome': clip_bounces[0].get('type', 'NO_MARKER') if clip_bounces else 'NO_MARKER',
         'length': clip_bounces[0].get('length') if clip_bounces else None,
         'speed_kmh': clip_bounces[0].get('speed_kmh', 0) if clip_bounces else 0,
+        'hit_detected': hit_occurred,
     }
     return last_marker_frame, clip_result
 
@@ -878,13 +1127,16 @@ def _clip_status_at_frame(frame_index, clips, job_bounces):
     """UI status for render pass — which clip is active at this frame."""
     for clip in clips:
         if clip.start <= frame_index <= clip.end:
-            for b in job_bounces:
-                if clip.start <= b.get('frame', 0) <= frame_index:
-                    lbl = b.get('type', 'DOTS')
-                    if lbl == 'RUNS':
-                        return "POST_HIT"
-                    if lbl == 'WICKETS':
-                        return "MISS"
+            clip_bounces = [
+                b for b in job_bounces
+                if clip.start <= b.get('frame', 0) <= frame_index
+            ]
+            if clip_bounces:
+                last = clip_bounces[-1]
+                if last.get('hit') is True:
+                    return "POST_HIT"
+                if last.get('hit') is False and frame_index > last.get('frame', 0) + 3:
+                    return "MISS"
             return "BOWLED"
     return "WAITING"
 
@@ -945,12 +1197,10 @@ def _render_video_clip_mode(cap, output_path, fps, width, height, total_frames, 
 
         event_status = _clip_status_at_frame(frame_index, clips, visible_job)
         stats = bounce_stats(visible_persistent)
-        status_color = {"WAITING": (128, 128, 128), "BOWLED": (0, 200, 255),
-                        "POST_HIT": (0, 255, 128), "MISS": (0, 80, 255)}.get(event_status, (255, 255, 255))
-        draw_ui_panel(frame, "STATUS", event_status, (15, 15), value_color=status_color)
-        draw_ui_panel(frame, "BALLS", str(stats['total']), (185, 15))
-        draw_ui_panel(frame, "FRAME", str(frame_index), (355, 15))
-        draw_ball_stats_panels(frame, stats)
+        draw_batsman_stats_hud(
+            frame, event_status, stats, fps,
+            frame_index=frame_index, clips=clips, bounces=visible_job,
+        )
 
         writer.write(frame)
         if frame_index % 25 == 0:
@@ -1062,10 +1312,10 @@ def _process_video_clip_mode(cap, output_path, job_id, model, use_half, yolo_dev
     conf_thresh = CONFIG['model']['confidence']
 
     def _pass1_progress(pct, frame_idx, total):
-        _set_job_progress(job_id, pct, frame_idx, total, pass_info='Pass 1: Finding delivery clips...')
+        _set_job_progress(job_id, pct, frame_idx, total)
 
     print("[ClipMode] Pass 1 — segmenting deliveries...")
-    _set_job_progress(job_id, 1, 0, total_frames, pass_info='Pass 1: Finding delivery clips...')
+    _set_job_progress(job_id, 1, 0, total_frames)
     clips = segment_deliveries(
         cap, model, fps, width, height, total_frames,
         conf_thresh=conf_thresh, use_half=use_half, yolo_device=yolo_device,
@@ -1181,6 +1431,7 @@ def process_video(input_path, output_path, job_id=None, options=None):
     kf = BallKalmanFilter(dt=dt)
     history = SmoothHistory(maxlen=200, smooth_window=3)
     raw_history = deque(maxlen=200)
+    det_history = deque(maxlen=200)
     frames_since_det = 999
     last_velocity = 0.0
     coast_limit = _coast_limit_frames(fps)
@@ -1224,6 +1475,7 @@ def process_video(input_path, output_path, job_id=None, options=None):
         detect_imgsz = gpu_infer['imgsz']
         infer_scale_run = min(1.0, gpu_infer['max_dim'] / max(width, height, 1))
         conf_thresh = CONFIG['model']['confidence']
+        post_contact = bounced_this_delivery or hit_occurred
 
         skip_detect = False
         if not STREAM_DETECT_EVERY_FRAME:
@@ -1247,10 +1499,16 @@ def process_video(input_path, output_path, job_id=None, options=None):
                 x1, y1, x2, y2 = box.xyxy[0].tolist()
                 bw, bh = (x2 - x1) * inv, (y2 - y1) * inv
                 area = bw * bh
-                if area < 12 or area > 1600: continue
+                if area < 25 or area > 550: continue  # Tighter size range
                 aspect = bw / (bh + 1e-5)
-                if not (0.3 < aspect < 3.0): continue
+                if not (0.75 < aspect < 1.35): continue  # Ball is ROUND
+                
+                ix1, iy1 = max(0, int(x1 * inv)), max(0, int(y1 * inv))
+                ix2, iy2 = min(width, int(x2 * inv)), min(height, int(y2 * inv))
                 cx, cy = int((x1 + x2) / 2 * inv), int((y1 + y2) / 2 * inv)
+                roi = frame[iy1:iy2, ix1:ix2] if ix2 > ix1 and iy2 > iy1 else None
+                if not ball_candidate_ok(cx, cy, roi, height, width, frame, post_contact=post_contact):
+                    continue
                 
                 if kf.initialized and frames_since_det <= coast_limit:
                     px, py = kf.get_position()
@@ -1300,8 +1558,9 @@ def process_video(input_path, output_path, job_id=None, options=None):
                     job_bounces, session_bounces, persistent_video_bounces,
                     fps=fps, last_marker_frame=last_marker_frame,
                     last_detection_conf=last_detection_conf,
-                    post_hit_max_speed=post_hit_max_speed)
-                kf, st = _reset_delivery_state(kf, dt, history, raw_history)
+                    post_hit_max_speed=post_hit_max_speed,
+                    hist_pts=list(raw_history), det_pts=list(det_history))
+                kf, st = _reset_delivery_state(kf, dt, history, raw_history, det_history)
                 last_marker_frame = -9999
                 hit_occurred = st['hit_occurred']
                 bounce_detected = st['bounce_detected']
@@ -1342,9 +1601,10 @@ def process_video(input_path, output_path, job_id=None, options=None):
                             job_bounces, session_bounces, persistent_video_bounces,
                             fps=fps, last_marker_frame=last_marker_frame,
                             last_detection_conf=last_detection_conf,
-                            post_hit_max_speed=post_hit_max_speed)
-                        history.clear()
+                            post_hit_max_speed=post_hit_max_speed,
+                            hist_pts=list(raw_history), det_pts=list(det_history))
                         raw_history.clear()
+                        det_history.clear()
                         kf = BallKalmanFilter(dt=dt)
                         kf.init(cx, cy)
                         hit_occurred = False
@@ -1359,23 +1619,26 @@ def process_video(input_path, output_path, job_id=None, options=None):
 
                 history.add((cx, cy))
                 raw_history.append((cx, cy))
+                det_history.append((cx, cy))
                 frames_since_det = 0
                 if event_status == "WAITING":
                     event_status = "BOWLED"
         elif kf.initialized and frames_since_det <= coast_limit:
             kf.predict()
             px, py = kf.get_position()
-            best_coords = (px, py)
-            is_predicted = True
-            history.add((px, py))
-            raw_history.append((px, py))
-            vx, vy = kf.get_velocity()
-            last_velocity = max(last_velocity, math.hypot(vx, vy))
+            if allow_ball_detection(py, height, post_contact=post_contact):
+                best_coords = (px, py)
+                is_predicted = True
+                history.add((px, py))
+                raw_history.append((px, py))
+                vx, vy = kf.get_velocity()
+                last_velocity = max(last_velocity, math.hypot(vx, vy))
         else:
             if kf.initialized:
                 kf.predict()
 
         raw_list = interpolate_track_gaps(list(raw_history), fps)
+        det_list = list(det_history)
         hist = history.get_list()
 
         pose_samples = None
@@ -1396,7 +1659,7 @@ def process_video(input_path, output_path, job_id=None, options=None):
         # ---- Bounce: one marker per delivery on pitch ----
         if event_status == "BOWLED" and not bounced_this_delivery and not hit_occurred:
             bounce_pt = _try_detect_bounce(
-                raw_list, frame_index, last_bounce_frame, fps, h_matrix,
+                det_list, frame_index, last_bounce_frame, fps, h_matrix,
                 persistent_video_bounces, height, width=width)
             if bounce_pt is not None:
                 bx, by = bounce_pt
@@ -1418,7 +1681,7 @@ def process_video(input_path, output_path, job_id=None, options=None):
                     speed_kmh=speed, detection_conf=last_detection_conf,
                     tracking_conf=tracking_conf, pose_data=pose_samples or None,
                     raw_pts=raw_list, height=height, fps=fps,
-                    last_marker_frame=last_marker_frame, strict=False)
+                    last_marker_frame=last_marker_frame, strict=False, hit=False)
                 if result[0] is not None:
                     length_zone = result[0]
                     last_marker_frame = result[1]
@@ -1426,6 +1689,56 @@ def process_video(input_path, output_path, job_id=None, options=None):
                     print(f"[Frame {frame_index}] BOUNCE #{len(persistent_video_bounces)} @ {video_bounce_coords} | {ball_label} | {length_zone} | {speed:.0f} km/h")
                 else:
                     bounced_this_delivery = False
+        elif bounced_this_delivery and not hit_occurred:
+            _try_refine_bounce_marker(
+                det_list, height, h_matrix, frame_index, job_bounces, session_bounces,
+                persistent_video_bounces, bounced_this_delivery, hit_occurred,
+                frames_since_bounce, fps)
+
+        # ---- Hit & Miss: only after ball reaches batsman approach zone ----
+        ball_near_batsman = bool(hist) and in_batsman_approach_zone(hist[-1][1], height)
+        if ball_near_batsman and event_status in ("BOWLED", "MISS") and not hit_occurred:
+            is_hit, hit_conf, contact = score_hit_enhanced(
+                raw_list, hist, height, fps, bounced_this_delivery, frames_since_bounce,
+                bounce_hist_idx=bounce_hist_idx, pose_frames=pose_samples)
+            if is_hit:
+                hit_occurred = True
+                event_status = "POST_HIT"
+                pre_hit_speed = math.hypot(hist[-2][0] - hist[-3][0], hist[-2][1] - hist[-3][1]) if len(hist) >= 3 else 0.0
+                post_hit_max_speed = math.hypot(hist[-1][0] - hist[-2][0], hist[-1][1] - hist[-2][1])
+                initial_label = 'RUNS' if post_hit_max_speed >= 8.0 else 'DOTS'
+                if bounced_this_delivery and job_bounces:
+                    _relable_last_bounce(job_bounces, session_bounces, persistent_video_bounces, initial_label, hit=True)
+                else:
+                    hp = contact or (hist[-3] if len(hist) >= 3 else hist[-1])
+                    speed = _compute_delivery_speed(raw_list, fps, height, h_matrix)
+                    result = _add_delivery_marker(
+                        hp[0], hp[1], h_matrix, initial_label, frame_index,
+                        job_bounces, session_bounces, persistent_video_bounces,
+                        speed_kmh=speed, raw_pts=raw_list, height=height, fps=fps,
+                        last_marker_frame=last_marker_frame, strict=False, hit=True)
+                    if result[0] is not None:
+                        last_marker_frame = result[1]
+                        bounced_this_delivery = True
+                print(f"[Frame {frame_index}] HIT — bat contact (conf={hit_conf:.2f})")
+
+        if event_status == "POST_HIT" and len(hist) >= 2:
+            speed = math.hypot(hist[-1][0] - hist[-2][0], hist[-1][1] - hist[-2][1])
+            post_hit_max_speed = max(post_hit_max_speed, speed)
+            label = 'RUNS' if post_hit_max_speed >= 8.0 else 'DOTS'
+            if classify_boundary(hist, post_hit_max_speed, height, pre_hit_speed):
+                label = 'BOUNDARIES'
+            if persistent_video_bounces and persistent_video_bounces[-1]['label'] in ('DOTS', 'RUNS', 'BOUNDARIES'):
+                _relable_last_bounce(job_bounces, session_bounces, persistent_video_bounces, label, hit=True)
+                print(f"[Frame {frame_index}] Relabeled to {label}")
+
+        if ball_near_batsman and event_status == "BOWLED" and bounced_this_delivery:
+            miss_ready = frames_since_bounce >= max(6, int(fps * 0.10))
+            if miss_ready and not hit_occurred and classify_miss(
+                    hist, height, hit_occurred, bounced_this_delivery, batsman_y_max=y_max_val):
+                event_status = "MISS"
+                _relable_last_bounce(job_bounces, session_bounces, persistent_video_bounces, 'WICKETS', hit=False)
+                print(f"[Frame {frame_index}] MISS — batsman left the ball")
 
         # ---- Reset tracking between deliveries (always, including POST_HIT) ----
         if frames_since_det > int(fps * 0.75):
@@ -1436,8 +1749,9 @@ def process_video(input_path, output_path, job_id=None, options=None):
                     job_bounces, session_bounces, persistent_video_bounces,
                     fps=fps, last_marker_frame=last_marker_frame,
                     last_detection_conf=last_detection_conf,
-                    post_hit_max_speed=post_hit_max_speed)
-                kf, st = _reset_delivery_state(kf, dt, history, raw_history)
+                    post_hit_max_speed=post_hit_max_speed,
+                    hist_pts=hist, y_max_val=y_max_val, det_pts=list(det_history))
+                kf, st = _reset_delivery_state(kf, dt, history, raw_history, det_history)
                 last_marker_frame = -9999
                 hit_occurred = st['hit_occurred']
                 event_status = st['event_status']
@@ -1449,47 +1763,6 @@ def process_video(input_path, output_path, job_id=None, options=None):
                 post_hit_max_speed = st['post_hit_max_speed']
                 pre_hit_speed = st['pre_hit_speed']
 
-        # ---- Hit & Miss Status Updates ----
-        if event_status in ("BOWLED", "MISS") and not hit_occurred:
-            is_hit, hit_conf, contact = score_hit_enhanced(
-                raw_list, hist, height, fps, bounced_this_delivery, frames_since_bounce,
-                bounce_hist_idx=bounce_hist_idx, pose_frames=pose_samples)
-            if is_hit:
-                hit_occurred = True
-                event_status = "POST_HIT"
-                pre_hit_speed = math.hypot(hist[-2][0] - hist[-3][0], hist[-2][1] - hist[-3][1]) if len(hist) >= 3 else 0.0
-                post_hit_max_speed = math.hypot(hist[-1][0] - hist[-2][0], hist[-1][1] - hist[-2][1])
-                initial_label = 'RUNS' if post_hit_max_speed >= 20.0 else 'DOTS'
-                if bounced_this_delivery and job_bounces:
-                    _relable_last_bounce(job_bounces, session_bounces, persistent_video_bounces, initial_label)
-                else:
-                    hp = contact or (hist[-3] if len(hist) >= 3 else hist[-1])
-                    speed = _compute_delivery_speed(raw_list, fps, height, h_matrix)
-                    result = _add_delivery_marker(
-                        hp[0], hp[1], h_matrix, initial_label, frame_index,
-                        job_bounces, session_bounces, persistent_video_bounces,
-                        speed_kmh=speed, raw_pts=raw_list, height=height, fps=fps,
-                        last_marker_frame=last_marker_frame, strict=False)
-                    if result[0] is not None:
-                        last_marker_frame = result[1]
-                        bounced_this_delivery = True
-                print(f"[Frame {frame_index}] HIT — RUN (conf={hit_conf:.2f})")
-
-        if event_status == "POST_HIT" and len(hist) >= 2:
-            speed = math.hypot(hist[-1][0] - hist[-2][0], hist[-1][1] - hist[-2][1])
-            post_hit_max_speed = max(post_hit_max_speed, speed)
-            label = 'RUNS' if post_hit_max_speed >= 20.0 else 'DOTS'
-            if classify_boundary(hist, post_hit_max_speed, height, pre_hit_speed):
-                label = 'BOUNDARIES'
-            if persistent_video_bounces and persistent_video_bounces[-1]['label'] in ('DOTS', 'RUNS', 'BOUNDARIES'):
-                _relable_last_bounce(job_bounces, session_bounces, persistent_video_bounces, label)
-                print(f"[Frame {frame_index}] Relabeled to {label}")
-
-        if event_status == "BOWLED" and bounced_this_delivery and classify_miss(hist, height, hit_occurred, bounced_this_delivery, batsman_y_max=y_max_val):
-            event_status = "MISS"
-            _relable_last_bounce(job_bounces, session_bounces, persistent_video_bounces, 'WICKETS')
-            print(f"[Frame {frame_index}] MISS — wicket/leave")
-
         if event_status == "POST_HIT" and best_coords:
             lx, ly = best_coords
             if (lx < -20 or lx > width+20 or ly < -20 or ly > height+20) and frames_since_det > int(fps * 0.8):
@@ -1499,8 +1772,9 @@ def process_video(input_path, output_path, job_id=None, options=None):
                     job_bounces, session_bounces, persistent_video_bounces,
                     fps=fps, last_marker_frame=last_marker_frame,
                     last_detection_conf=last_detection_conf,
-                    post_hit_max_speed=post_hit_max_speed)
-                kf, st = _reset_delivery_state(kf, dt, history, raw_history)
+                    post_hit_max_speed=post_hit_max_speed,
+                    hist_pts=hist, y_max_val=y_max_val, det_pts=list(det_history))
+                kf, st = _reset_delivery_state(kf, dt, history, raw_history, det_history)
                 last_marker_frame = -9999
                 hit_occurred = st['hit_occurred']
                 event_status = st['event_status']
@@ -1534,12 +1808,10 @@ def process_video(input_path, output_path, job_id=None, options=None):
             draw_light_bounce_dots(frame, persistent_video_bounces, use_video_coords=True, H_matrix=h_matrix)
 
         stats = bounce_stats(persistent_video_bounces)
-        status_color = {"WAITING":(128,128,128),"BOWLED":(0,200,255),
-                        "POST_HIT":(0,255,128),"MISS":(0,80,255)}.get(event_status,(255,255,255))
-        draw_ui_panel(frame,"STATUS",event_status,(15,15),value_color=status_color)
-        draw_ui_panel(frame,"BALLS",str(stats['total']),(185,15))
-        draw_ui_panel(frame,"FRAME",str(frame_index),(355,15))
-        draw_ball_stats_panels(frame, stats)
+        draw_batsman_stats_hud(
+            frame, event_status, stats, fps,
+            hit_occurred=hit_occurred, bounces=persistent_video_bounces,
+        )
 
         writer.write(frame)
         if frame_index % 25 == 0:
@@ -1553,7 +1825,8 @@ def process_video(input_path, output_path, job_id=None, options=None):
         job_bounces, session_bounces, persistent_video_bounces,
         fps=fps, last_marker_frame=last_marker_frame,
         last_detection_conf=last_detection_conf,
-        post_hit_max_speed=post_hit_max_speed)
+        post_hit_max_speed=post_hit_max_speed,
+        hist_pts=history.get_list(), det_pts=list(det_history))
     _set_job_progress(job_id, 95, frame_index, total_frames)
 
     # ---- END SUMMARY: centred pitch map ----

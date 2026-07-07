@@ -11,6 +11,7 @@ import cv2
 
 from core.config import CONFIG
 from core.delivery_filter import can_start_new_delivery, min_gap_frames
+from core.ball_detection_filters import ball_candidate_ok
 
 _PROC = CONFIG.get("processing", {})
 CLIP_SCAN_STRIDE = int(_PROC.get("clip_scan_stride", 2))
@@ -68,16 +69,21 @@ def detect_ball_light(
         x1, y1, x2, y2 = box.xyxy[0].tolist()
         bw, bh = (x2 - x1) * inv, (y2 - y1) * inv
         area = bw * bh
-        if area < 12 or area > 1600:
+        if area < 25 or area > 550:  # Tighter size range
             continue
         aspect = bw / (bh + 1e-5)
-        if not (0.3 < aspect < 3.0):
+        if not (0.75 < aspect < 1.35):  # Ball is ROUND
+            continue
+        cx = int((x1 + x2) / 2 * inv)
+        cy = int((y1 + y2) / 2 * inv)
+        ix1, iy1 = max(0, int(x1 * inv)), max(0, int(y1 * inv))
+        ix2, iy2 = min(width, int(x2 * inv)), min(height, int(y2 * inv))
+        roi = frame[iy1:iy2, ix1:ix2] if ix2 > ix1 and iy2 > iy1 else None
+        if not ball_candidate_ok(cx, cy, roi, height, width, frame):
             continue
         conf = float(box.conf[0].item())
         if conf > best_conf:
             best_conf = conf
-            cx = int((x1 + x2) / 2 * inv)
-            cy = int((y1 + y2) / 2 * inv)
             best = (cx, cy, conf)
     return best
 
@@ -110,7 +116,7 @@ def segment_deliveries(
     last_ball_frame = 0
     last_marker_frame = -9999
     frame_idx = 0
-    scan_conf = max(conf_thresh, SCAN_CONF)
+    scan_conf = min(conf_thresh, SCAN_CONF)  # Use LOWER confidence for initial clip scan
 
     while True:
         ret, frame = cap.read()

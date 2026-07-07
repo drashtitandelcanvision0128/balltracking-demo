@@ -14,6 +14,7 @@ export interface BounceEvent {
   clip_index?: number;
   clip_start?: number;
   clip_end?: number;
+  hit?: boolean;
 }
 
 export interface DeliveryClip {
@@ -28,6 +29,7 @@ export interface DeliveryClip {
   start_time?: number;
   end_time?: number;
   track_frames?: number;
+  hit_detected?: boolean;
 }
 
 export interface JobSummary {

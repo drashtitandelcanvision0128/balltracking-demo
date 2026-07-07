@@ -11,11 +11,11 @@ from core.config import CONFIG
 
 _FILT = CONFIG.get("delivery_filter", {})
 
-MIN_TRACK_FRAMES = int(_FILT.get("min_track_frames", 5))
-MIN_TRACK_FRAMES_STRICT = int(_FILT.get("min_track_frames_strict", 8))
-MIN_Y_TRAVEL_RATIO = float(_FILT.get("min_y_travel_ratio", 0.05))
+MIN_TRACK_FRAMES = int(_FILT.get("min_track_frames", 10))
+MIN_TRACK_FRAMES_STRICT = int(_FILT.get("min_track_frames_strict", 12))
+MIN_Y_TRAVEL_RATIO = float(_FILT.get("min_y_travel_ratio", 0.15))
 MIN_DELIVERY_GAP_SEC = float(_FILT.get("min_delivery_gap_sec", 0.8))
-MIN_NEW_DET_CONF = float(_FILT.get("min_new_detection_conf", 0.15))
+MIN_NEW_DET_CONF = float(_FILT.get("min_new_detection_conf", 0.30))
 ABSURD_SPEED_KMH = float(_FILT.get("absurd_speed_kmh", 350))
 MIN_FRAMES_BETWEEN_MARKERS = int(_FILT.get("min_frames_between_markers", 18))
 

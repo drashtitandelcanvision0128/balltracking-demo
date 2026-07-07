@@ -2,8 +2,7 @@
 import React, { useState, useRef, useCallback, useEffect } from 'react';
 import Link from 'next/link';
 import AnalyticsPanel from '../components/AnalyticsPanel';
-import PitchMapCanvas from '../components/PitchMapCanvas';
-import PitchCalibration, { type PitchPoint } from '../components/PitchCalibration';
+// import PitchCalibration, { type PitchPoint } from '../components/PitchCalibration';
 import { API_BASE, buildVideoUrl, buildReportPdfUrl, type Analytics, type BounceEvent, type DeliveryClip } from '../lib/api';
 
 interface Player {
@@ -68,8 +67,10 @@ const CricketTrajectoryPredictor: React.FC = () => {
   const [hasMounted, setHasMounted] = useState<boolean>(false);
   const [showDropdown, setShowDropdown] = useState<boolean>(false);
   const [selectedPlayer, setSelectedPlayer] = useState<Player | null>(null);
-  const [pitchCalibration, setPitchCalibration] = useState<PitchPoint[] | null>(null);
+  const [isLiveActive, setIsLiveActive] = useState<boolean>(false);
+  // const [pitchCalibration, setPitchCalibration] = useState<PitchPoint[] | null>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
+  const liveVideoRef = useRef<HTMLVideoElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const dropdownRef = useRef<HTMLDivElement>(null);
   const pollIntervalRef = useRef<NodeJS.Timeout | null>(null);
@@ -132,6 +133,33 @@ const CricketTrajectoryPredictor: React.FC = () => {
     }
   }, [selectedPlayer, hasMounted]);
 
+  useEffect(() => {
+    let stream: MediaStream | null = null;
+    if (isLiveActive) {
+      navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' }, audio: false })
+        .then((s) => {
+          stream = s;
+          if (liveVideoRef.current) {
+            liveVideoRef.current.srcObject = s;
+          }
+        })
+        .catch(err => {
+          console.error("Error accessing camera: ", err);
+          setStatusText("Could not access camera. Please check permissions.");
+          setIsLiveActive(false);
+        });
+    }
+
+    return () => {
+      if (stream) {
+        stream.getTracks().forEach(track => track.stop());
+      }
+      if (liveVideoRef.current) {
+        liveVideoRef.current.srcObject = null;
+      }
+    };
+  }, [isLiveActive]);
+
   const handleLogout = () => {
     localStorage.removeItem('userLoggedIn');
     setIsLoggedIn(false);
@@ -163,7 +191,7 @@ const CricketTrajectoryPredictor: React.FC = () => {
       setReportPdfUrl('');
       setActiveJobId('');
       setProcessingMode('');
-      setPitchCalibration(null);
+      // setPitchCalibration(null);
       // Clear previous video URL
       if (videoUrl && videoUrl.startsWith('blob:')) {
         URL.revokeObjectURL(videoUrl);
@@ -295,9 +323,9 @@ const CricketTrajectoryPredictor: React.FC = () => {
 
     const formData = new FormData();
     formData.append('video', selectedFile);
-    if (pitchCalibration && pitchCalibration.length === 4) {
-      formData.append('pitch_calibration', JSON.stringify(pitchCalibration));
-    }
+    // if (pitchCalibration && pitchCalibration.length === 4) {
+    //   formData.append('pitch_calibration', JSON.stringify(pitchCalibration));
+    // }
 
     try {
       const response = await fetch(`${API_BASE}/predict`, {
@@ -493,7 +521,6 @@ const CricketTrajectoryPredictor: React.FC = () => {
             </div>
             <div style={styles.headerActions}>
               <div style={{display: 'flex', gap: '10px', alignItems: 'center'}}>
-                <Link href="/analytics" style={styles.authButton}>Analytics</Link>
                 {hasMounted && (isLoggedIn ? (
                   <div style={{ position: 'relative' }} ref={dropdownRef}>
                     <div 
@@ -592,7 +619,29 @@ const CricketTrajectoryPredictor: React.FC = () => {
                     <p style={styles.processingText}>AI Processing in Progress...</p>
                   </div>
                 )}
-                {videoUrl ? (
+                {isLiveActive ? (
+                  <div style={{ position: 'relative', width: '100%', height: '100%', minHeight: '360px', background: '#030A0A', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                    <video
+                      ref={liveVideoRef}
+                      autoPlay
+                      playsInline
+                      muted
+                      style={{ width: '100%', height: '100%', objectFit: 'contain' }}
+                    />
+                    <button
+                      onClick={(e) => { e.stopPropagation(); setIsLiveActive(false); }}
+                      style={{ position: 'absolute', top: '16px', right: '16px', background: 'rgba(0,0,0,0.6)', color: '#fff', border: '1px solid rgba(255,255,255,0.2)', borderRadius: '8px', padding: '8px 12px', cursor: 'pointer', fontSize: '0.8rem', zIndex: 10 }}
+                    >
+                      ✕ Close Camera
+                    </button>
+                    <div style={{ position: 'absolute', bottom: '20px', left: '0', right: '0', display: 'flex', justifyContent: 'center', zIndex: 10 }}>
+                       <button style={{ background: '#38F0B0', padding: '10px 24px', borderRadius: '24px', color: '#030A0A', fontSize: '1rem', fontWeight: 600, display: 'flex', alignItems: 'center', cursor: 'pointer', border: 'none', boxShadow: '0 4px 12px rgba(56, 240, 176, 0.3)' }}>
+                         <span style={{ width: '10px', height: '10px', background: '#ff3b30', borderRadius: '50%', marginRight: '10px', animation: 'pulse 1.5s infinite' }}></span>
+                         Start live camera detection
+                       </button>
+                    </div>
+                  </div>
+                ) : videoUrl ? (
                   <video
                     ref={videoRef}
                     src={videoUrl || undefined}
@@ -612,13 +661,26 @@ const CricketTrajectoryPredictor: React.FC = () => {
                       <line x1="12" y1="3" x2="12" y2="15"></line>
                     </svg>
                     <p style={styles.dropZoneText}>Drag & drop your video here, or <span style={styles.browseLink}>click to browse</span></p>
+                    <div style={{ marginTop: '1.5rem', paddingTop: '1.5rem', borderTop: '1px solid rgba(56,240,176,0.15)', width: '80%', textAlign: 'center' }} onClick={(e) => e.stopPropagation()}>
+                      <p style={{ color: '#8AA898', fontSize: '0.85rem', marginBottom: '0.75rem' }}>Or track directly using your camera</p>
+                      <button 
+                        onClick={(e) => { e.stopPropagation(); e.preventDefault(); setIsLiveActive(true); }}
+                        style={{...styles.authButton, display: 'inline-flex', alignItems: 'center', padding: '8px 16px', textDecoration: 'none', border: 'none', cursor: 'pointer'}}
+                      >
+                        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{marginRight: '8px'}}>
+                          <polygon points="23 7 16 12 23 17 23 7"></polygon>
+                          <rect x="1" y="5" width="15" height="14" rx="2" ry="2"></rect>
+                        </svg>
+                        Open Live Camera
+                      </button>
+                    </div>
                   </div>
                 )}
               </div>
 
-              {selectedFile && videoUrl && !isProcessing && (
+              {/* {selectedFile && videoUrl && !isProcessing && (
                 <PitchCalibration videoUrl={videoUrl} onChange={setPitchCalibration} />
-              )}
+              )} */}
 
               <div style={styles.statusBar}>
                 <span style={styles.statusText}>{statusText}</span>
@@ -758,6 +820,18 @@ const CricketTrajectoryPredictor: React.FC = () => {
                               <span style={{ fontSize: '0.7rem', color: '#A3C2B2' }}>{Math.round(clip.speed_kmh)} km/h</span>
                             ) : null}
                             <span style={{ ...styles.deliveryOutcome, color: outcomeColor }}>{outcome}</span>
+                            {clip.hit_detected !== undefined && (
+                              <span style={{
+                                fontSize: '0.62rem',
+                                padding: '2px 6px',
+                                borderRadius: '4px',
+                                fontWeight: '600',
+                                background: clip.hit_detected ? 'rgba(80, 220, 80, 0.15)' : 'rgba(240, 56, 112, 0.15)',
+                                color: clip.hit_detected ? '#50DC50' : '#F03870',
+                              }}>
+                                {clip.hit_detected ? 'HIT' : 'MISS'}
+                              </span>
+                            )}
                           </div>
                         );
                       })}
@@ -792,6 +866,18 @@ const CricketTrajectoryPredictor: React.FC = () => {
                               <span style={{ fontSize: '0.7rem', color: '#A3C2B2' }}>{speedText}</span>
                             )}
                             <span style={{ ...styles.deliveryOutcome, color: outcomeColor }}>{outcome}</span>
+                            {d.hit !== undefined && (
+                              <span style={{
+                                fontSize: '0.62rem',
+                                padding: '2px 6px',
+                                borderRadius: '4px',
+                                fontWeight: '600',
+                                background: d.hit ? 'rgba(80, 220, 80, 0.15)' : 'rgba(240, 56, 112, 0.15)',
+                                color: d.hit ? '#50DC50' : '#F03870',
+                              }}>
+                                {d.hit ? 'HIT' : 'MISS'}
+                              </span>
+                            )}
                           </div>
                         );
                       })}
@@ -841,7 +927,7 @@ const CricketTrajectoryPredictor: React.FC = () => {
                 </div>
               </div>
 
-              {deliveries.length > 0 && (
+              {/* {deliveries.length > 0 && (
                 <div style={styles.statsPanel}>
                   <div style={styles.statsTitle}>LIVE PITCH MAP</div>
                   <PitchMapCanvas
@@ -853,7 +939,7 @@ const CricketTrajectoryPredictor: React.FC = () => {
                     }}
                   />
                 </div>
-              )}
+              )} */}
 
               {(analytics || deliveries.length > 0) && (
                 <AnalyticsPanel analytics={analytics} avgSpeed={avgSpeed} maxSpeed={maxSpeed} avgConfidence={avgConfidence} />

@@ -14,8 +14,8 @@ BATSMAN_ZONE_Y_MAX = 0.92
 POST_BOUNCE_HIT_COOLDOWN_FRAMES = 2
 
 # Minimum confidence (0–1) to label a delivery as RUN/HIT
-HIT_CONFIDENCE_THRESHOLD = 0.40
-POST_BOUNCE_HIT_THRESHOLD = 0.36
+HIT_CONFIDENCE_THRESHOLD = 0.36
+POST_BOUNCE_HIT_THRESHOLD = 0.32
 
 # Boundary: post-hit speed vs pre-hit speed ratio
 BOUNDARY_SPEED_RATIO = 1.85
@@ -133,48 +133,67 @@ def calibrate_pitch_from_video(cap, width, height, fallback_quad, max_samples=40
     return out.astype(np.float32)
 
 
-def refine_bounce_point(raw_pts, height, lookback=14):
+def confirm_pitch_bounce(
+    raw_pts,
+    height,
+    ground_y_ratio=0.65,
+    lookback=40,
+    min_descent=4,
+    min_fall_ratio=0.10,
+    min_rise_px=14.0,
+):
     """
-    Find bounce apex using local Y minima after downward motion (more stable than 3-frame diff).
-    lookback limits search to recent frames so older bounces in the same track are ignored.
+    Pitch bounce = global deepest point in recent detections, after a long fall,
+    with a real post-bounce rise. Rejects mid-air points while the ball is still
+    descending toward the batsman (common on long-flight deliveries).
     """
-    if len(raw_pts) < 5:
+    if len(raw_pts) < 8:
         return None
-    start = max(0, len(raw_pts) - lookback)
-    segment = raw_pts[start:]
+    segment = list(raw_pts[-lookback:])
     n = len(segment)
-    best_i, best_score = None, -1e9
-    for i in range(2, n - 2):
-        y0, y1, y2, y3, y4 = (segment[j][1] for j in (i - 2, i - 1, i, i + 1, i + 2))
-        if not (y1 < y2 and y3 < y2 and y0 < y2):
-            continue
-        if y2 < height * 0.43:
-            continue
+    min_rise = max(float(min_rise_px), height * 0.012)
+    min_fall = height * float(min_fall_ratio)
 
-        # Prevent false bounce detections in the air:
-        # 1. The bounce candidate (y2) must be very close to the lowest tracked point (maximum Y) in the segment.
-        max_y_in_segment = max(p[1] for p in segment)
-        if y2 < max_y_in_segment - 3:
-            continue
+    max_idx = max(range(n), key=lambda i: segment[i][1])
+    bx, by = segment[max_idx]
+    max_y = by
 
-        # 2. The ball must have risen (Y-coordinate decreased) in the frames after the bounce candidate.
-        has_risen = False
-        for j in range(i + 1, n):
-            if segment[j][1] < y2 - 6:
-                has_risen = True
-                break
-        if not has_risen:
-            continue
-
-        depth = (y2 - y1) + (y2 - y3)
-        flatness = abs(y1 - y3)
-        score = depth - flatness * 0.5
-        if score > best_score:
-            best_score = score
-            best_i = i
-    if best_i is None:
+    if max_y < height * ground_y_ratio:
         return None
-    return segment[best_i]
+
+    # Deepest point is still at the end — ball has not bounced yet, still falling
+    if max_idx >= n - 2:
+        return None
+
+    # Must have fallen a long way since tracking started (not a short air wobble)
+    if by - segment[0][1] < min_fall:
+        return None
+
+    desc = sum(1 for k in range(1, max_idx + 1) if segment[k][1] > segment[k - 1][1] + 0.5)
+    if desc < min_descent:
+        return None
+
+    after = segment[max_idx + 1:]
+    if not after:
+        return None
+    rise_amplitude = by - min(p[1] for p in after)
+    if rise_amplitude < min_rise:
+        return None
+
+    rise_streak = 0
+    for j in range(max_idx + 1, n):
+        if segment[j][1] < segment[j - 1][1] - 0.8:
+            rise_streak += 1
+            if rise_streak >= 2:
+                return segment[max_idx]
+        else:
+            rise_streak = 0
+    return None
+
+
+def refine_bounce_point(raw_pts, height, lookback=14):
+    """Wrapper — uses strict pitch bounce confirmation."""
+    return confirm_pitch_bounce(raw_pts, height, lookback=lookback)
 
 
 def _segment_speeds(raw_pts, fps):
@@ -367,19 +386,26 @@ def classify_boundary(hist_pts, post_hit_max_speed, height, pre_hit_speed):
 
 def classify_miss(hist_pts, height, hit_occurred, bounced, batsman_y_max=0.92):
     """Ball passed batsman without contact — wicket / leave."""
-    if hit_occurred or not bounced or len(hist_pts) < 4:
+    if hit_occurred or not bounced or len(hist_pts) < 5:
         return False
-    recent = hist_pts[-4:]
-    # Monotonic downward in frame (toward keeper/stumps)
+    recent = hist_pts[-5:]
     ys = [p[1] for p in recent]
-    
-    # Dynamic threshold based on batsman_y_max, with a safe upper limit of 70% height
-    miss_y_threshold = max(height * 0.70, height * (batsman_y_max - 0.15))
+    xs = [p[0] for p in recent]
+
+    # Ball must have entered the batting band then continued past the batsman
+    bat_band_top = height * BATSMAN_ZONE_Y_MIN
+    bat_band_bot = height * min(batsman_y_max + 0.04, 0.94)
+    entered_batting = any(bat_band_top <= y <= bat_band_bot for y in ys)
+    if not entered_batting:
+        return False
+
+    miss_y_threshold = max(height * 0.58, height * (batsman_y_max - 0.06))
     if ys[-1] < miss_y_threshold:
         return False
-        
-    downward = all(ys[i + 1] >= ys[i] - 2 for i in range(len(ys) - 1))
-    return downward
+
+    downward = ys[-1] >= ys[0] - 4 and (ys[-1] - ys[0]) >= height * 0.04
+    straight_past = abs(xs[-1] - xs[0]) < height * 0.35
+    return downward and straight_past
 
 
 def snap_to_pitch(px, py, pitch_l, pitch_r, pitch_top, pitch_bot, margin=8):

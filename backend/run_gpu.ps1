@@ -5,12 +5,17 @@ $ErrorActionPreference = "Stop"
 $Backend = $PSScriptRoot
 $Root = Split-Path -Parent $Backend
 $Python = Join-Path $Root ".venv\Scripts\python.exe"
+$PythonArgs = @()
+if (-not (Test-Path $Python)) {
+    $Python = "py"
+    $PythonArgs = @("-3.12")
+}
 
 $env:PYTHONPATH = $Backend
 $env:CUDA_MODULE_LOADING = "LAZY"
 
 Write-Host "Checking GPU..."
-& $Python -c @"
+& $Python $PythonArgs -c @"
 from core.gpu_runtime import init_gpu_runtime
 d, half, name = init_gpu_runtime()
 print(f'Ready: {name} | device={d} | fp16={half}')
@@ -23,4 +28,4 @@ if ($LASTEXITCODE -ne 0) {
 
 Set-Location $Backend
 Write-Host "Starting GPU server on http://localhost:5000 ..."
-& $Python predict_server.py
+& $Python $PythonArgs -u predict_server.py
