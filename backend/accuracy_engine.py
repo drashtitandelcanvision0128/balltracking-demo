@@ -133,6 +133,243 @@ def calibrate_pitch_from_video(cap, width, height, fallback_quad, max_samples=40
     return out.astype(np.float32)
 
 
+def _flight_phase_seen(
+    segment: list,
+    bounce_i: int,
+    height: int,
+    width: int,
+    origin_pt: tuple,
+) -> bool:
+    """Reject release-hand arc — real bounce only after visible in-flight travel."""
+    if bounce_i < 4:
+        return False
+    pre = segment[:bounce_i]
+    bx, by = segment[bounce_i][0], segment[bounce_i][1]
+    rx, ry = origin_pt[0], origin_pt[1]
+    landscape = width > 0 and width > height * 1.12
+    if landscape:
+        total_x = abs(segment[-1][0] - rx)
+        if total_x < width * 0.05:
+            return False
+        prog = abs(bx - rx)
+        if prog < max(width * 0.11, total_x * 0.40):
+            return False
+        min_y = min(p[1] for p in pre)
+        if min_y <= by - height * 0.022:
+            return True
+        return prog >= width * 0.14
+    min_y = min(p[1] for p in pre)
+    return (by - min_y) >= height * 0.038
+
+
+def _batsman_x_progress(p0: tuple, p_end: tuple, pt: tuple) -> float:
+    """Signed progress toward batsman along X (positive = toward batsman end)."""
+    axis = float(p_end[0] - p0[0])
+    if abs(axis) < 8.0:
+        return math.hypot(pt[0] - p0[0], pt[1] - p0[1])
+    axis_sign = 1.0 if axis > 0 else -1.0
+    return (float(pt[0]) - float(p0[0])) * axis_sign
+
+
+def _step_toward_batsman(segment: list, i: int, p0: tuple, p_end: tuple) -> bool:
+    """Recent step moves toward batsman along X (not release recoil)."""
+    if i < 1:
+        return False
+    axis = float(p_end[0] - p0[0])
+    if abs(axis) < 12.0:
+        return True
+    step_x = float(segment[i][0] - segment[i - 1][0])
+    return step_x * axis > -3.0
+
+
+def _landscape_x_pitch_touch(
+    segment: list,
+    height: int,
+    ground_y_ratio: float,
+    min_rise_px: float,
+    skip_release_ratio: float,
+    min_along_ratio: float,
+    origin_pt: tuple,
+    cam_quad=None,
+    width: int = 0,
+) -> tuple[int, int] | None:
+    """
+    Side-on: bounce where ball traveling toward batsman (X) touches the pitch turf.
+    Point = deepest Y on that X approach, snapped to pitch ground at contact X.
+    """
+    n = len(segment)
+    p0 = origin_pt
+    p_end = segment[-1]
+    total_x = abs(float(p_end[0] - p0[0]))
+    if total_x < max(width * 0.05, 40.0):
+        return None
+
+    ground_line = height * float(ground_y_ratio)
+    min_rise = max(float(min_rise_px), height * 0.010)
+    min_idx = max(12, int(n * float(skip_release_ratio)))
+    min_x_prog = max(width * 0.08, total_x * float(min_along_ratio))
+    max_x_prog = total_x * 0.92
+    air_tol = max(14.0, height * 0.028)
+
+    try:
+        from core.homography import pitch_ground_y_at_x
+    except Exception:
+        pitch_ground_y_at_x = None
+
+    best_pt = None
+    best_y = -1.0
+
+    for i in range(min_idx, n - 2):
+        if not _step_toward_batsman(segment, i, p0, p_end):
+            continue
+        pt = segment[i]
+        x_prog = _batsman_x_progress(p0, p_end, pt)
+        if x_prog < min_x_prog or x_prog > max_x_prog:
+            continue
+
+        y_curr = float(pt[1])
+        if y_curr < ground_line:
+            continue
+        if pitch_ground_y_at_x is not None and cam_quad is not None:
+            turf_y = pitch_ground_y_at_x(pt[0], cam_quad)
+            if y_curr < turf_y - air_tol:
+                continue
+        elif width > 0:
+            turf_y = height * float(ground_y_ratio)
+            if y_curr < turf_y - air_tol:
+                continue
+
+        before = segment[:i]
+        after = segment[i + 1:]
+        if not before or not after:
+            continue
+        if min(p[1] for p in before) > y_curr - height * 0.018:
+            continue
+
+        rise = y_curr - min(p[1] for p in after)
+        if rise < min_rise:
+            continue
+        rise_streak = 0
+        for j in range(i + 1, n):
+            if segment[j][1] < segment[j - 1][1] - 0.35:
+                rise_streak += 1
+                if rise_streak >= 2:
+                    break
+            else:
+                rise_streak = 0
+        if rise_streak < 2:
+            continue
+
+        if y_curr > best_y:
+            best_y = y_curr
+            best_pt = pt
+
+    if best_pt is None:
+        return None
+    bx, by = best_pt
+    if pitch_ground_y_at_x is not None and cam_quad is not None:
+        turf_y = pitch_ground_y_at_x(bx, cam_quad)
+        by = int(round(max(float(by), turf_y - 2.0)))
+    return (int(bx), int(by))
+
+
+def _deepest_bounce_point(
+    segment: list,
+    height: int,
+    ground_y_ratio: float,
+    min_rise_px: float,
+    width: int = 0,
+    skip_release_ratio: float = 0.42,
+    min_along_ratio: float = 0.48,
+    origin_pt: tuple | None = None,
+    cam_quad=None,
+) -> tuple[int, int] | None:
+    """
+    Pitch bounce on pitch turf.
+    Landscape side-on: X-travel toward batsman — touch point on pitch at contact X.
+    Portrait/rear: deepest Y with rise after release.
+    """
+    n = len(segment)
+    if n < 10:
+        return None
+    p0 = origin_pt if origin_pt is not None else segment[0]
+    landscape = width > 0 and width > height * 1.12
+
+    if landscape:
+        return _landscape_x_pitch_touch(
+            segment, height, ground_y_ratio, min_rise_px,
+            skip_release_ratio, min_along_ratio, p0,
+            cam_quad=cam_quad, width=width,
+        )
+
+    p_end = segment[-1]
+    span = math.hypot(p_end[0] - p0[0], p_end[1] - p0[1])
+    if span < max(40.0, height * 0.06):
+        return None
+
+    ground_line = height * float(ground_y_ratio)
+    min_rise = max(float(min_rise_px), height * 0.010)
+    min_idx = max(18, int(n * float(skip_release_ratio)))
+    air_tol = max(14.0, height * 0.028)
+
+    try:
+        from core.homography import pitch_ground_y_at_x
+    except Exception:
+        pitch_ground_y_at_x = None
+
+    best_pt = None
+    best_y = -1.0
+
+    for i in range(min_idx, n - 2):
+        pt = segment[i]
+        y_curr = float(pt[1])
+        if y_curr < ground_line:
+            continue
+        if pitch_ground_y_at_x is not None and cam_quad is not None:
+            turf_y = pitch_ground_y_at_x(pt[0], cam_quad)
+            if y_curr < turf_y - air_tol:
+                continue
+        if not _flight_phase_seen(segment, i, height, width, p0):
+            continue
+
+        along = math.hypot(pt[0] - p0[0], pt[1] - p0[1])
+        if along < span * float(min_along_ratio):
+            continue
+
+        before = segment[:i]
+        after = segment[i + 1:]
+        if not before or not after:
+            continue
+        # Was in flight above the landing point
+        if min(p[1] for p in before) > y_curr - height * 0.02:
+            continue
+        # Rose after pitch contact (image Y decreases)
+        rise = y_curr - min(p[1] for p in after)
+        if rise < min_rise:
+            continue
+        rise_streak = 0
+        for j in range(i + 1, n):
+            if segment[j][1] < segment[j - 1][1] - 0.4:
+                rise_streak += 1
+                if rise_streak >= 2:
+                    break
+            else:
+                rise_streak = 0
+        if rise_streak < 2:
+            continue
+
+        if y_curr > best_y:
+            best_y = y_curr
+            best_pt = pt
+
+    if best_pt is not None and pitch_ground_y_at_x is not None and cam_quad is not None:
+        bx, by = best_pt
+        turf_y = pitch_ground_y_at_x(bx, cam_quad)
+        best_pt = (bx, int(round(max(float(by), turf_y - 2.0))))
+
+    return tuple(best_pt) if best_pt is not None else None
+
+
 def confirm_pitch_bounce(
     raw_pts,
     height,
@@ -141,54 +378,29 @@ def confirm_pitch_bounce(
     min_descent=4,
     min_fall_ratio=0.10,
     min_rise_px=14.0,
+    width=0,
+    skip_release_ratio=0.25,
+    min_along_ratio=0.32,
+    lock_pt=None,
+    cam_quad=None,
 ):
     """
-    Pitch bounce = global deepest point in recent detections, after a long fall,
-    with a real post-bounce rise. Rejects mid-air points while the ball is still
-    descending toward the batsman (common on long-flight deliveries).
+    Bowler/machine release → batsman: pitch touch point.
+    Landscape: where ball cuts the pitch along X toward batsman.
+    Portrait: deepest track point on turf with rise after contact.
     """
-    if len(raw_pts) < 8:
+    if len(raw_pts) < 12:
         return None
-    segment = list(raw_pts[-lookback:])
-    n = len(segment)
-    min_rise = max(float(min_rise_px), height * 0.012)
-    min_fall = height * float(min_fall_ratio)
+    segment = list(raw_pts[-lookback:] if lookback and len(raw_pts) > lookback else raw_pts)
+    origin = tuple(lock_pt) if lock_pt is not None else None
 
-    max_idx = max(range(n), key=lambda i: segment[i][1])
-    bx, by = segment[max_idx]
-    max_y = by
-
-    if max_y < height * ground_y_ratio:
-        return None
-
-    # Deepest point is still at the end — ball has not bounced yet, still falling
-    if max_idx >= n - 2:
-        return None
-
-    # Must have fallen a long way since tracking started (not a short air wobble)
-    if by - segment[0][1] < min_fall:
-        return None
-
-    desc = sum(1 for k in range(1, max_idx + 1) if segment[k][1] > segment[k - 1][1] + 0.5)
-    if desc < min_descent:
-        return None
-
-    after = segment[max_idx + 1:]
-    if not after:
-        return None
-    rise_amplitude = by - min(p[1] for p in after)
-    if rise_amplitude < min_rise:
-        return None
-
-    rise_streak = 0
-    for j in range(max_idx + 1, n):
-        if segment[j][1] < segment[j - 1][1] - 0.8:
-            rise_streak += 1
-            if rise_streak >= 2:
-                return segment[max_idx]
-        else:
-            rise_streak = 0
-    return None
+    return _deepest_bounce_point(
+        segment, height, ground_y_ratio, min_rise_px, width,
+        skip_release_ratio=skip_release_ratio,
+        min_along_ratio=min_along_ratio,
+        origin_pt=origin,
+        cam_quad=cam_quad,
+    )
 
 
 def refine_bounce_point(raw_pts, height, lookback=14):

@@ -469,6 +469,20 @@ def draw_light_bounce_dots(frame, bounces, use_video_coords=True, H_matrix=None,
             _draw_delivery_info_card(frame, cx, cy, length, label, color)
 
 
+def draw_predicted_bounce_marker(frame, cx: int, cy: int, length_hint: str = ""):
+    """Ghost marker for pre-bounce landing prediction (Hawk-Eye style)."""
+    h, w = frame.shape[:2]
+    if not (0 <= cx < w and 0 <= cy < h):
+        return
+    color = (0, 210, 255)  # amber/cyan on BGR
+    cv2.circle(frame, (cx, cy), 12, color, 2, cv2.LINE_AA)
+    cv2.drawMarker(frame, (cx, cy), color, markerType=cv2.MARKER_CROSS, markerSize=18, thickness=2, line_type=cv2.LINE_AA)
+    label = "PRED"
+    if length_hint:
+        label = f"PRED {length_hint[:12]}"
+    cv2.putText(frame, label, (cx + 14, cy - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.42, color, 1, cv2.LINE_AA)
+
+
 def create_hawkeye_template(bowler_name='PITCH MAP'):
     img = np.zeros((MAP_H, MAP_W, 3), dtype=np.uint8)
     img[:] = (40, 100, 40)
@@ -510,21 +524,9 @@ def render_pitch_map(bounces, bowler_name='PITCH MAP', base_img=None):
 
 
 def auto_pitch_quad(width, height):
-    """Map pitch template onto video — aligned with stumps on the ground plane."""
-    cx = width * 0.5
-    portrait = height > width * 1.15
-    if portrait:
-        top_y, bot_y = height * 0.53, height * 0.95
-        top_hw, bot_hw = width * 0.09, width * 0.29
-    else:
-        top_y, bot_y = height * 0.46, height * 0.90
-        top_hw, bot_hw = width * 0.09, width * 0.26
-    return np.array([
-        [cx - top_hw, top_y],
-        [cx + top_hw, top_y],
-        [cx - bot_hw, bot_y],
-        [cx + bot_hw, bot_y],
-    ], dtype=np.float32)
+    """Map pitch template onto video — landscape side-on excludes machine/right clutter."""
+    from core.homography import auto_pitch_quad as _auto_quad
+    return _auto_quad(width, height)
 
 
 _TEMPLATE_CACHE = {}

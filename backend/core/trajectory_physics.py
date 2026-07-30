@@ -7,9 +7,10 @@ from __future__ import annotations
 import math
 from typing import Sequence
 
+import cv2
 import numpy as np
 
-from core.pitch_coords import video_to_world
+from core.pitch_coords import pitchmap_to_world, video_to_pitchmap, video_to_world
 
 
 def fit_parabolic_y(xs: list[float], ys: list[float]) -> tuple[float, float, float] | None:
@@ -147,8 +148,124 @@ def predict_pre_bounce_landing(
     if disc < 0:
         return None
     roots = [(-b + math.sqrt(disc)) / (2 * a), (-b - math.sqrt(disc)) / (2 * a)]
-    valid = [r for r in roots if 0 <= r <= 22]
+    valid = [r for r in roots if -1.6 <= r <= 1.6]
     if not valid:
         return None
     x_land = min(valid, key=abs)
     return round(x_land, 3), 0.0
+
+
+def predict_bounce_pixel_parabola(
+    raw_pts: list[tuple[int, int]],
+    height: int,
+    ground_y_ratio: float = 0.65,
+) -> tuple[int, int] | None:
+    """Extrapolate image-plane parabola to the pitch ground line (pixels)."""
+    if len(raw_pts) < 6:
+        return None
+    seg = raw_pts[-min(14, len(raw_pts)) :]
+    ground_y = height * ground_y_ratio
+    if seg[-1][1] >= ground_y - 8:
+        return None
+    if seg[-1][1] <= seg[0][1] + height * 0.015:
+        return None
+
+    xs = [float(p[0]) for p in seg]
+    ys = [float(p[1]) for p in seg]
+    fit = fit_parabolic_y(xs, ys)
+    if fit is None:
+        return None
+    a, b, c = fit
+    if abs(a) < 1e-8:
+        if abs(b) < 1e-6:
+            return None
+        x_land = (ground_y - c) / b
+    else:
+        disc = b * b - 4 * a * (c - ground_y)
+        if disc < 0:
+            return None
+        roots = [(-b + math.sqrt(disc)) / (2 * a), (-b - math.sqrt(disc)) / (2 * a)]
+        x_land = roots[0]
+        if len(roots) > 1:
+            mid_x = xs[-1]
+            x_land = min(roots, key=lambda r: abs(r - mid_x))
+
+    x_min, x_max = min(xs), max(xs)
+    span = max(40.0, (x_max - x_min) * 2.5)
+    if not (x_min - span <= x_land <= x_max + span):
+        return None
+    return int(round(x_land)), int(round(ground_y))
+
+
+def predict_bounce_landing(
+    raw_pts: list[tuple[int, int]],
+    h_matrix: np.ndarray | None,
+    h_inv: np.ndarray | None,
+    fps: float,
+    height: int,
+    width: int = 0,
+    ground_y_ratio: float = 0.65,
+) -> dict | None:
+    """
+    Predict where the ball will bounce before contact.
+    Returns video + pitch-map + world coords when trajectory is stable enough.
+    """
+    if len(raw_pts) < 6:
+        return None
+    seg = raw_pts[-min(16, len(raw_pts)) :]
+    if seg[-1][1] <= seg[0][1] + max(6, height * 0.02):
+        return None
+
+    world_xy = None
+    pitch_xy = None
+    video_xy = None
+    method = None
+
+    if h_matrix is not None:
+        world_xy = predict_pre_bounce_landing(seg, h_matrix, fps)
+        if world_xy is not None and h_inv is not None:
+            from core.pitch_coords import world_to_pitchmap
+
+            x_m, y_m = world_xy
+            if not (0.0 <= y_m <= 20.5 and abs(x_m) <= 2.2):
+                world_xy = None
+            else:
+                px, py = world_to_pitchmap(x_m, y_m)
+                pt = cv2.perspectiveTransform(
+                    np.array([[[float(px), float(py)]]], dtype=np.float32), h_inv
+                )
+                video_xy = (int(pt[0, 0, 0]), int(pt[0, 0, 1]))
+                pitch_xy = (px, py)
+                method = "world_parabola"
+
+    if video_xy is None:
+        pixel_pt = predict_bounce_pixel_parabola(seg, height, ground_y_ratio=ground_y_ratio)
+        if pixel_pt is None:
+            return None
+        video_xy = pixel_pt
+        method = "pixel_parabola"
+        if h_matrix is not None:
+            try:
+                px, py = video_to_pitchmap(float(video_xy[0]), float(video_xy[1]), h_matrix)
+                pitch_xy = (px, py)
+                world_xy = pitchmap_to_world(px, py)
+            except Exception:
+                pitch_xy = None
+                world_xy = None
+
+    if video_xy is None:
+        return None
+    vx, vy = video_xy
+    if not (-width * 0.15 <= vx <= width * 1.15 and -height * 0.1 <= vy <= height * 1.05):
+        return None
+
+    out = {
+        "video": video_xy,
+        "method": method,
+    }
+    if pitch_xy is not None:
+        out["pitchmap"] = pitch_xy
+    if world_xy is not None:
+        out["bounce_x"] = world_xy[0]
+        out["bounce_y"] = world_xy[1]
+    return out

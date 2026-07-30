@@ -38,7 +38,7 @@ const LENGTH_LABEL: Record<string, string> = {
 const CricketTrajectoryPredictor: React.FC = () => {
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [fileName, setFileName] = useState<string>('video.mp4');
-  const [statusText, setStatusText] = useState<string>('Ready. Select a video to analyze trajectory.');
+  const [statusText, setStatusText] = useState<string>('Ready. Select a video to detect pitch points.');
   const [isProcessing, setIsProcessing] = useState<boolean>(false);
   const [isProcessed, setIsProcessed] = useState<boolean>(false);
   const [videoUrl, setVideoUrl] = useState<string>('');
@@ -128,7 +128,7 @@ const CricketTrajectoryPredictor: React.FC = () => {
         setHitDetected(false);
         setVideoUrl('');
         setDownloadUrl('');
-        setStatusText('Ready. Select a video to analyze trajectory.');
+        setStatusText('Ready. Select a video to detect pitch points.');
       }
     }
   }, [selectedPlayer, hasMounted]);
@@ -468,13 +468,13 @@ const CricketTrajectoryPredictor: React.FC = () => {
       
       const link = document.createElement('a');
       link.href = blobUrl;
-      link.download = `predicted_${selectedFile?.name || 'trajectory_video.mp4'}`;
+      link.download = `predicted_${selectedFile?.name || 'pitch_points_video.mp4'}`;
       document.body.appendChild(link);
       link.click();
       document.body.removeChild(link);
       
       window.URL.revokeObjectURL(blobUrl);
-      setStatusText('Download started: predicted trajectory video.');
+      setStatusText('Download started: pitch point video.');
     } catch (error) {
       console.error('Download error:', error);
       setStatusText('Download failed. Opening in new tab instead.');

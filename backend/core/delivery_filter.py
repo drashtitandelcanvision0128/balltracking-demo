@@ -18,6 +18,11 @@ MIN_DELIVERY_GAP_SEC = float(_FILT.get("min_delivery_gap_sec", 0.8))
 MIN_NEW_DET_CONF = float(_FILT.get("min_new_detection_conf", 0.30))
 ABSURD_SPEED_KMH = float(_FILT.get("absurd_speed_kmh", 350))
 MIN_FRAMES_BETWEEN_MARKERS = int(_FILT.get("min_frames_between_markers", 18))
+MIN_LOCK_FRAMES = int(_FILT.get("min_lock_frames", 3))
+MIN_LOCK_TRAVEL_PX = float(_FILT.get("min_lock_travel_px", 12))
+MIN_LOCK_DY_PX = float(_FILT.get("min_lock_dy_px", 8))
+STATIC_REJECT_PX = float(_FILT.get("static_reject_px", 6))
+STATIC_TRACK_FRAMES = int(_FILT.get("static_track_frames", 4))
 
 
 def min_gap_frames(fps: float) -> int:
@@ -37,13 +42,21 @@ def compute_track_speed_kmh(raw_pts: list, fps: float, height: int) -> float:
     return peak_px_s * meters_per_px * 3.6
 
 
-def has_min_motion(raw_pts: list, height: int, min_frames: int | None = None) -> bool:
+def has_min_motion(raw_pts: list, height: int, min_frames: int | None = None, width: int = 0) -> bool:
     """Basic motion check — enough frames and visible travel."""
+    from core.ball_detection_filters import is_landscape_frame
+
     need = min_frames or MIN_TRACK_FRAMES
     if len(raw_pts) < need:
         return False
     ys = [p[1] for p in raw_pts]
-    if max(ys) - min(ys) < height * MIN_Y_TRAVEL_RATIO:
+    xs = [p[0] for p in raw_pts]
+    y_travel = max(ys) - min(ys)
+    x_travel = max(xs) - min(xs)
+    if width > 0 and is_landscape_frame(width, height):
+        if x_travel >= height * MIN_Y_TRAVEL_RATIO * 0.55:
+            return True
+    if y_travel < height * MIN_Y_TRAVEL_RATIO:
         return False
     return True
 
@@ -60,13 +73,14 @@ def is_valid_delivery_track(
     fps: float,
     *,
     strict: bool = False,
+    width: int = 0,
 ) -> bool:
     """
     strict=False: real bounce/hit markers (lenient).
     strict=True:  fallback close-delivery only (reject obvious noise).
     """
     need = MIN_TRACK_FRAMES_STRICT if strict else MIN_TRACK_FRAMES
-    if not has_min_motion(raw_pts, height, need):
+    if not has_min_motion(raw_pts, height, need, width=width):
         return False
     # Speed glitch filter only for fallback close-delivery (pixel speed is unreliable)
     if strict and is_absurd_speed(raw_pts, fps, height):
@@ -79,6 +93,57 @@ def is_valid_delivery_track(
         if x_spread > height * 0.85 and y_travel < height * 0.12:
             return False
     return True
+
+
+def pending_delivery_confirmed(points: list, height: int, width: int = 0) -> bool:
+    """Require visible motion before locking — rejects nuts/bolts and static false positives."""
+    from core.ball_detection_filters import is_landscape_frame, in_ground_resting_band, in_machine_release_zone
+
+    if len(points) < MIN_LOCK_FRAMES:
+        return False
+    recent = points[-MIN_LOCK_FRAMES:]
+    xs = [p[0] for p in recent]
+    ys = [p[1] for p in recent]
+    path_len = sum(
+        math.hypot(recent[i][0] - recent[i - 1][0], recent[i][1] - recent[i - 1][1])
+        for i in range(1, len(recent))
+    )
+    net_span = math.hypot(max(xs) - min(xs), max(ys) - min(ys))
+    min_travel = max(MIN_LOCK_TRAVEL_PX, height * 0.006)
+    if width > 0 and all(in_ground_resting_band(p[1], height, width) for p in recent):
+        min_travel = max(min_travel * 2.5, height * 0.018)
+    elif width > 0 and in_machine_release_zone(recent[0][0], recent[0][1], width, height):
+        min_travel = max(MIN_LOCK_TRAVEL_PX * 0.55, height * 0.003)
+    if path_len < min_travel or net_span < min_travel * 0.65:
+        return False
+    if net_span < STATIC_REJECT_PX:
+        return False
+    dx = abs(recent[-1][0] - recent[0][0])
+    dy = recent[-1][1] - recent[0][1]
+    min_dy = max(MIN_LOCK_DY_PX, height * 0.004)
+    # Side-on landscape: ball travels horizontally across frame toward batsman
+    if width > 0 and is_landscape_frame(width, height):
+        from_machine = in_machine_release_zone(recent[0][0], recent[0][1], width, height)
+        if from_machine:
+            if path_len >= min_travel or abs(dy) >= min_dy * 0.6 or dx >= min_travel * 0.35:
+                return True
+        if dx >= min_travel * 0.45 or dy >= min_dy:
+            return True
+        return net_span >= min_travel
+    if dy < min_dy:
+        return False
+    return True
+
+
+def track_is_static(points: list, min_points: int | None = None) -> bool:
+    """True when recent track points barely move (stationary object)."""
+    need = min_points or STATIC_TRACK_FRAMES
+    if len(points) < need:
+        return False
+    recent = points[-need:]
+    xs = [p[0] for p in recent]
+    ys = [p[1] for p in recent]
+    return math.hypot(max(xs) - min(xs), max(ys) - min(ys)) < STATIC_REJECT_PX
 
 
 def can_start_new_delivery(

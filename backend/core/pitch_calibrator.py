@@ -14,7 +14,10 @@ import cv2
 import numpy as np
 
 from accuracy_engine import sample_video_frames, _pitch_mask
+from core.config import CONFIG
 from pitch_map_renderer import auto_pitch_quad
+
+_PITCH_CFG = CONFIG.get("pitch", {})
 
 STUMP_WIDTH_M = 0.2286
 
@@ -174,13 +177,14 @@ def calibrate_pitch_robust(
     *,
     manual_quad: np.ndarray | list | None = None,
     max_samples: int = 30,
-    blend_fallback: float = 0.05,
+    blend_fallback: float = 0.08,
 ) -> CalibrationResult:
     """
     Best-available pitch quad for homography.
     Priority: manual > stump+colour consensus > colour > auto fallback.
     """
     fallback = auto_pitch_quad(width, height)
+    blend_fallback = float(_PITCH_CFG.get("homography_blend_fallback", blend_fallback))
 
     if manual_quad is not None:
         quad = normalize_manual_quad(manual_quad)

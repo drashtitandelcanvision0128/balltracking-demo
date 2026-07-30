@@ -1,4 +1,4 @@
-# GPU-only backend start (RTX 4050 / CUDA 12.x)
+# GPU-only backend start (RTX 3050 / CUDA 12.x)
 # Run: .\run_gpu.ps1
 
 $ErrorActionPreference = "Stop"
@@ -12,7 +12,20 @@ if (-not (Test-Path $Python)) {
 }
 
 $env:PYTHONPATH = $Backend
+$env:PYTHONUNBUFFERED = "1"
 $env:CUDA_MODULE_LOADING = "LAZY"
+
+function Stop-PortListener([int]$Port) {
+    $pids = @(Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue |
+        Select-Object -ExpandProperty OwningProcess -Unique)
+    foreach ($procId in $pids) {
+        if ($procId -and $procId -gt 0) {
+            Write-Host "Stopping old server on port $Port (PID $procId)..." -ForegroundColor Yellow
+            Stop-Process -Id $procId -Force -ErrorAction SilentlyContinue
+        }
+    }
+    if ($pids.Count -gt 0) { Start-Sleep -Seconds 1 }
+}
 
 Write-Host "Checking GPU..."
 & $Python $PythonArgs -c @"
@@ -26,6 +39,19 @@ if ($LASTEXITCODE -ne 0) {
     exit 1
 }
 
+Stop-PortListener -Port 5000
+
 Set-Location $Backend
-Write-Host "Starting GPU server on http://localhost:5000 ..."
+Write-Host ""
+Write-Host "Starting backend on http://localhost:5000" -ForegroundColor Green
+Write-Host "Keep this window open. Press Ctrl+C to stop." -ForegroundColor DarkGray
+Write-Host ""
+
+# Flask writes its banner to stderr — do not treat that as a PowerShell error
+$ErrorActionPreference = "Continue"
 & $Python $PythonArgs -u predict_server.py
+$exit = $LASTEXITCODE
+if ($exit -ne 0) {
+    Write-Host "Server exited with code $exit" -ForegroundColor Red
+}
+exit $exit

@@ -1,7 +1,7 @@
 model:
-  confidence: 0.35
+  confidence: 0.20
   image_size: 1280
-  path: runs/detect/train5/weights/best.pt
+  path: runs/detect/train5/weights/ball_best.pt
   tracker: bytetrack
 physics:
   hit_angle_threshold: 35
@@ -40,16 +40,55 @@ processing:
   clip_end_padding: 50
   clip_lost_sec: 1.15
   clip_scan_conf: 0.08
+  waiting_conf: 0.12
+  ball_color_skip_conf: 0.12
+  # Track ball from release through flight (not only near batsman / not ground clutter)
+  track_delivery_in_flight: true
+  reject_ground_resting_ball: true
+  reject_metallic_hardware: true
+  require_ball_color_for_lock: false
+  detect_pitch_area_only: true
+  pitch_flight_margin_px: 110
+  machine_release_zone:
+    enabled: true
+    x_min_ratio: 0.50
+    x_max_ratio: 0.90
+    y_min_ratio: 0.18
+    y_max_ratio: 0.76
+  ground_resting_y_offset: 0.06
+  ground_resting_y_min_landscape: 0.82
+  ground_resting_y_min_portrait: 0.78
   clip_deep_imgsz: 1280
   ball_approach_y_min: 0.55
+  ball_approach_y_min_landscape: 0.30
   ball_approach_y_min_after_contact: 0.28
   # Bounce near batsman — frame ke is % se neeche hona chahiye (long flight air reject)
   bounce_ground_y_min: 0.65
-  bounce_min_track_frames: 10
+  bounce_ground_y_min_landscape: 0.72
+  bounce_min_track_frames: 26
   bounce_lookback_frames: 40
-  bounce_min_descent_frames: 4
-  bounce_min_fall_ratio: 0.10
-  bounce_min_rise_px: 14
+  bounce_min_descent_frames: 5
+  bounce_min_fall_ratio: 0.12
+  bounce_min_rise_px: 16
+  bounce_skip_release_ratio: 0.35
+  bounce_min_along_ratio: 0.40
+  bounce_min_seconds_after_lock: 0.38
+  bounce_min_dist_from_lock_ratio: 0.12
+  bounce_predict_min_frames: 6
+  bounce_refine_enabled: false
+  # Ball bbox size scales with resolution (ref: 478x850 portrait)
+  ball_size_ref_height: 850
+  ball_min_area: 25
+  ball_max_area: 550
+  # Handheld / shaky video: auto turns on when median shake exceeds threshold
+  stabilization:
+    mode: always          # auto | always | off
+    smooth: 0.90        # higher = smoother, more lag on intentional pan
+    max_shift_ratio: 0.07
+    max_rotate_deg: 3.5
+    shake_enable_px: 2.8
+    probe_frames: 24
+    downsample: 480
   supported_formats:
   - .mp4
   - .avi
@@ -62,13 +101,25 @@ tracking:
   max_queue_size: 120
   max_skip_frames: 10
   stride: 1
-  coast_seconds: 0.45
+  coast_seconds: 0.40
+  kalman:
+    process_noise_pos: 0.12
+    process_noise_vel: 0.90
+    measurement_noise: 0.035
+    max_gate_px: 220
 pitch:
   length_m: 20.12
   width_m: 3.05
   stump_width_m: 0.2286
   calibration_samples: 30
   prefer_manual_calibration: true
+  homography_blend_fallback: 0.08
+  landscape_quad:
+    top_y_ratio: 0.40
+    bot_y_ratio: 0.88
+    left_x_ratio: 0.16
+    right_x_ratio: 0.56
+    bot_spread_ratio: 0.05
 visualization:
   show_heatmap: true
   show_predictions: false
@@ -90,9 +141,9 @@ gpu:
   fuse_layers: true
   memory_fraction: 0.85
   warmup_imgsz: 640
-  waiting_imgsz: 640
-  waiting_max_dim: 640
-  waiting_stride: 2
+  waiting_imgsz: 1280
+  waiting_max_dim: 1280
+  waiting_stride: 1
   active_imgsz: 1280
   active_max_dim: 1280
   nvenc: true
@@ -104,6 +155,12 @@ delivery_filter:
   min_track_frames_strict: 8
   min_y_travel_ratio: 0.08
   min_delivery_gap_sec: 0.80
-  min_new_detection_conf: 0.25
+  min_new_detection_conf: 0.15
   absurd_speed_kmh: 500
   min_frames_between_markers: 14
+  min_lock_frames: 2
+  min_lock_travel_px: 10
+  min_lock_dy_px: 6
+  pending_clear_sec: 0.65
+  static_reject_px: 6
+  static_track_frames: 4

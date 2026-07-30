@@ -11,7 +11,7 @@ import cv2
 
 from core.config import CONFIG
 from core.delivery_filter import can_start_new_delivery, min_gap_frames
-from core.ball_detection_filters import ball_candidate_ok
+from core.ball_detection_filters import ball_candidate_ok, ball_bbox_size_ok, is_ball_class
 
 _PROC = CONFIG.get("processing", {})
 CLIP_SCAN_STRIDE = int(_PROC.get("clip_scan_stride", 2))
@@ -64,12 +64,12 @@ def detect_ball_light(
     best = None
     best_conf = -1.0
     for box in results[0].boxes:
-        if int(box.cls[0].item()) != 0:
+        if not is_ball_class(int(box.cls[0].item())):
             continue
         x1, y1, x2, y2 = box.xyxy[0].tolist()
         bw, bh = (x2 - x1) * inv, (y2 - y1) * inv
         area = bw * bh
-        if area < 25 or area > 550:  # Tighter size range
+        if not ball_bbox_size_ok(area, height, width):
             continue
         aspect = bw / (bh + 1e-5)
         if not (0.75 < aspect < 1.35):  # Ball is ROUND
@@ -79,9 +79,9 @@ def detect_ball_light(
         ix1, iy1 = max(0, int(x1 * inv)), max(0, int(y1 * inv))
         ix2, iy2 = min(width, int(x2 * inv)), min(height, int(y2 * inv))
         roi = frame[iy1:iy2, ix1:ix2] if ix2 > ix1 and iy2 > iy1 else None
-        if not ball_candidate_ok(cx, cy, roi, height, width, frame):
-            continue
         conf = float(box.conf[0].item())
+        if not ball_candidate_ok(cx, cy, roi, height, width, frame, det_conf=conf):
+            continue
         if conf > best_conf:
             best_conf = conf
             best = (cx, cy, conf)

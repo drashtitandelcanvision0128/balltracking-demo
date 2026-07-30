@@ -13,7 +13,7 @@ _DEFAULTS: dict[str, Any] = {
     "model": {
         "confidence": 0.35,
         "image_size": 1280,
-        "path": "runs/detect/train5/weights/best.pt",
+        "path": "runs/detect/train5/weights/new_best.pt",
         "tracker": "bytetrack",
     },
     "physics": {
