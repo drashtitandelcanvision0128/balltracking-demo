@@ -44,6 +44,9 @@ Stop-PortListener -Port 5000
 Set-Location $Backend
 Write-Host ""
 Write-Host "Starting backend on http://localhost:5000" -ForegroundColor Green
+if (-not (Test-Path (Join-Path $Backend ".env"))) {
+    Write-Host "Tip: copy backend\.env.example to backend\.env and set GEMINI_API_KEY" -ForegroundColor Yellow
+}
 Write-Host "Keep this window open. Press Ctrl+C to stop." -ForegroundColor DarkGray
 Write-Host ""
 

@@ -217,7 +217,6 @@ def _landscape_x_pitch_touch(
         pitch_ground_y_at_x = None
 
     best_pt = None
-    best_y = -1.0
 
     for i in range(min_idx, n - 2):
         if not _step_toward_batsman(segment, i, p0, p_end):
@@ -230,6 +229,7 @@ def _landscape_x_pitch_touch(
         y_curr = float(pt[1])
         if y_curr < ground_line:
             continue
+        turf_y = None
         if pitch_ground_y_at_x is not None and cam_quad is not None:
             turf_y = pitch_ground_y_at_x(pt[0], cam_quad)
             if y_curr < turf_y - air_tol:
@@ -260,17 +260,13 @@ def _landscape_x_pitch_touch(
         if rise_streak < 2:
             continue
 
-        if y_curr > best_y:
-            best_y = y_curr
-            best_pt = pt
+        # First pitch touch while traveling toward batsman on X
+        bx, by = pt[0], pt[1]
+        if turf_y is not None:
+            by = int(round(max(float(by), turf_y - 2.0)))
+        return (int(bx), int(by))
 
-    if best_pt is None:
-        return None
-    bx, by = best_pt
-    if pitch_ground_y_at_x is not None and cam_quad is not None:
-        turf_y = pitch_ground_y_at_x(bx, cam_quad)
-        by = int(round(max(float(by), turf_y - 2.0)))
-    return (int(bx), int(by))
+    return None
 
 
 def _deepest_bounce_point(

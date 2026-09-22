@@ -1,7 +1,7 @@
 model:
-  confidence: 0.20
+  confidence: 0.08
   image_size: 1280
-  path: runs/detect/train5/weights/ball_best.pt
+  path: runs/detect/Bowlinger3/BallDetection_OnlyBall_v2/weights/best.pt
   tracker: bytetrack
 physics:
   hit_angle_threshold: 35
@@ -40,14 +40,16 @@ processing:
   clip_end_padding: 50
   clip_lost_sec: 1.15
   clip_scan_conf: 0.08
-  waiting_conf: 0.12
-  ball_color_skip_conf: 0.12
-  # Track ball from release through flight (not only near batsman / not ground clutter)
+  waiting_conf: 0.06
+  ball_trust_conf: 0.06
+  release_lock_conf: 0.22
+  ball_only_pipeline: true
+  ball_color_skip_conf: 0.20
   track_delivery_in_flight: true
-  reject_ground_resting_ball: true
+  reject_ground_resting_ball: false
   reject_metallic_hardware: true
   require_ball_color_for_lock: false
-  detect_pitch_area_only: true
+  detect_pitch_area_only: false
   pitch_flight_margin_px: 110
   machine_release_zone:
     enabled: true
@@ -55,6 +57,20 @@ processing:
     x_max_ratio: 0.90
     y_min_ratio: 0.18
     y_max_ratio: 0.76
+  flight_corridor:
+    enabled: true
+    margin_px: 40
+    override_conf: 0.26
+    auto_refine: true
+    sample_frames: 20
+    expand_x_ratio: 0.06
+    expand_y_ratio: 0.08
+    flight_margin_px: 110
+    batsman_end:
+      x_min_ratio: 0.02
+      x_max_ratio: 0.48
+      y_min_ratio: 0.10
+      y_max_ratio: 0.94
   ground_resting_y_offset: 0.06
   ground_resting_y_min_landscape: 0.82
   ground_resting_y_min_portrait: 0.78
@@ -64,25 +80,56 @@ processing:
   ball_approach_y_min_after_contact: 0.28
   # Bounce near batsman — frame ke is % se neeche hona chahiye (long flight air reject)
   bounce_ground_y_min: 0.65
-  bounce_ground_y_min_landscape: 0.72
-  bounce_min_track_frames: 26
+  bounce_ground_y_min_landscape: 0.40
+  bounce_min_track_frames: 18
   bounce_lookback_frames: 40
   bounce_min_descent_frames: 5
   bounce_min_fall_ratio: 0.12
-  bounce_min_rise_px: 16
+  bounce_min_rise_px: 12
   bounce_skip_release_ratio: 0.35
   bounce_min_along_ratio: 0.40
-  bounce_min_seconds_after_lock: 0.38
+  bounce_min_seconds_after_lock: 0.28
   bounce_min_dist_from_lock_ratio: 0.12
   bounce_predict_min_frames: 6
   bounce_refine_enabled: false
+  bounce_dot_only: true
+  bounce_mark_mode: first_lowest
+  auto_video_setup: true
+  delivery_ball_only: true
+  small_ball_detect:
+    enabled: true
+    min_infer_scale: 0.72
+    min_area_scale: 0.35
+    lane_margin_px: 72
+    high_conf_bypass: 0.32
+  bounce_direction_min_confidence: 0.48
+  bounce_frames_after_contact: 5
   # Ball bbox size scales with resolution (ref: 478x850 portrait)
   ball_size_ref_height: 850
-  ball_min_area: 25
+  ball_min_area: 8
   ball_max_area: 550
+  ball_max_lock_area: 420
+  ball_max_lock_area_machine_mult: 2.2
+  watch_from_release:
+    enabled: true
+    require_machine_lock: false
+    coast_seconds: 0.90
+    delivery_lost_sec: 1.35
+    gap_finalize_sec: 1.20
+    post_bounce_watch_sec: 0.55
+  fully_automatic:
+    enabled: true
+    player_detection: true
+    show_player_labels: false
+    auto_recalibrate: true
+    recalibrate_interval_sec: 18
+    recalibrate_shake_px: 3.5
+    person_model: yolo11n.pt
+    person_conf: 0.35
+    player_sample_frames: 8
   # Handheld / shaky video: auto turns on when median shake exceeds threshold
   stabilization:
-    mode: always          # auto | always | off
+    mode: off
     smooth: 0.90        # higher = smoother, more lag on intentional pan
     max_shift_ratio: 0.07
     max_rotate_deg: 3.5
@@ -101,7 +148,7 @@ tracking:
   max_queue_size: 120
   max_skip_frames: 10
   stride: 1
-  coast_seconds: 0.40
+  coast_seconds: 0.90
   kalman:
     process_noise_pos: 0.12
     process_noise_vel: 0.90
@@ -121,8 +168,14 @@ pitch:
     right_x_ratio: 0.56
     bot_spread_ratio: 0.05
 visualization:
-  show_heatmap: true
+  show_heatmap: false
   show_predictions: false
+  show_ball_track: false
+  show_bounce_prediction: false
+  show_full_trajectory: false
+  show_future_path: false
+  show_pitch_bounce_dot_only: true
+  show_calib_pitch_outline: false
   trail_length: 0
   show_trajectory_lines: false
   show_corner_pitch_map: false
@@ -135,7 +188,7 @@ redis:
 gpu:
   require_cuda: false
   device_id: 0
-  half_precision: true
+  half_precision: false
   cudnn_benchmark: true
   allow_tf32: true
   fuse_layers: true
@@ -146,21 +199,46 @@ gpu:
   waiting_stride: 1
   active_imgsz: 1280
   active_max_dim: 1280
+  uhd_imgsz: 1920
+  uhd_max_dim: 2560
+  hd_imgsz: 1600
+  hd_max_dim: 1600
   nvenc: true
   enable_pose: true
   calibration_samples: 30
   summary_seconds: 1
 delivery_filter:
   min_track_frames: 6
-  min_track_frames_strict: 8
-  min_y_travel_ratio: 0.08
-  min_delivery_gap_sec: 0.80
-  min_new_detection_conf: 0.15
+  min_track_frames_strict: 10
+  min_y_travel_ratio: 0.10
+  min_delivery_gap_sec: 1.0
+  min_new_detection_conf: 0.06
   absurd_speed_kmh: 500
-  min_frames_between_markers: 14
-  min_lock_frames: 2
-  min_lock_travel_px: 10
-  min_lock_dy_px: 6
+  min_frames_between_markers: 28
+  min_lock_frames: 3
+  min_lock_travel_px: 14
+  min_lock_dy_px: 8
   pending_clear_sec: 0.65
   static_reject_px: 6
   static_track_frames: 4
+gemini:
+  enabled: true
+  model: gemini-2.0-flash
+  api_key_env: GEMINI_API_KEY
+  mode: umpire
+  temperature: 0.0
+  min_confidence: 0.65
+  review_band_low: 0.18
+  review_band_high: 0.55
+  verify_frames: 3
+  max_frame_width: 720
+  bounce_enabled: false
+deep_learning:
+  enabled: true
+  weights_dir: runs/dl
+  auto_train_bootstrap: true
+  prefer_dl_over_rules: true
+  min_bounce_confidence: 0.55
+  enable_pose: true
+  enable_player_detection: true
+  enable_gemini_bounce: false

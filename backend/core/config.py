@@ -13,7 +13,7 @@ _DEFAULTS: dict[str, Any] = {
     "model": {
         "confidence": 0.35,
         "image_size": 1280,
-        "path": "runs/detect/train5/weights/new_best.pt",
+        "path": "runs/detect/Bowlinger3/BallDetection_OnlyBall_v2/weights/best.pt",
         "tracker": "bytetrack",
     },
     "physics": {
@@ -95,6 +95,19 @@ _DEFAULTS: dict[str, Any] = {
         "min_new_detection_conf": 0.25,
         "absurd_speed_kmh": 500,
         "min_frames_between_markers": 14,
+    },
+    "gemini": {
+        "enabled": False,
+        "model": "gemini-2.0-flash",
+        "api_key_env": "GEMINI_API_KEY",
+        "mode": "umpire",
+        "temperature": 0.0,
+        "min_confidence": 0.65,
+        "review_band_low": 0.18,
+        "review_band_high": 0.55,
+        "verify_frames": 3,
+        "max_frame_width": 720,
+        "bounce_enabled": False,
     },
 }
 

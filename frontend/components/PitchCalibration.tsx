@@ -4,7 +4,18 @@ import React, { useCallback, useEffect, useRef, useState } from "react";
 
 export type PitchPoint = [number, number];
 
-const CORNER_LABELS = ["Top-Left (bowler end)", "Top-Right", "Bottom-Right", "Bottom-Left (batsman end)"];
+const CORNER_LABELS_LANDSCAPE = [
+  "Top-Left (batsman end)",
+  "Top-Right (machine end)",
+  "Bottom-Right (machine end)",
+  "Bottom-Left (batsman end)",
+];
+const CORNER_LABELS_PORTRAIT = [
+  "Top-Left (bowler end)",
+  "Top-Right",
+  "Bottom-Right",
+  "Bottom-Left (batsman end)",
+];
 
 interface PitchCalibrationProps {
   videoUrl: string;
@@ -17,6 +28,8 @@ export default function PitchCalibration({ videoUrl, onChange }: PitchCalibratio
   const [points, setPoints] = useState<PitchPoint[]>([]);
   const [active, setActive] = useState(false);
   const [videoSize, setVideoSize] = useState({ w: 0, h: 0 });
+  const cornerLabels =
+    videoSize.w > videoSize.h * 1.12 ? CORNER_LABELS_LANDSCAPE : CORNER_LABELS_PORTRAIT;
 
   const syncCanvas = useCallback(() => {
     const video = videoRef.current;
@@ -128,7 +141,7 @@ export default function PitchCalibration({ videoUrl, onChange }: PitchCalibratio
         </div>
       </div>
       <p style={{ color: "#aaa", fontSize: 12, margin: "0 0 8px" }}>
-        Click 4 pitch corners in order: {CORNER_LABELS.join(" → ")}. For best results, use the bowler end as the top-left corner and the batsman end as the bottom-left corner.
+        Click 4 pitch corners in order: {cornerLabels.join(" → ")}.
         {points.length < 4 && active ? ` (${points.length}/4)` : points.length === 4 ? " ✓ Done" : ""}
       </p>
       <div style={{ position: "relative", display: "inline-block", maxWidth: "100%" }}>

@@ -398,14 +398,16 @@ def warp_pitch_overlay(frame, overlay, mask, H_inv, alpha=0.44):
     return out.astype(np.uint8)
 
 
-def draw_live_ball_track(frame, coords, trail_pts=None, is_predicted=False):
-    """Live ball position + short motion trail (visible during delivery)."""
+def draw_live_ball_track(frame, coords, trail_pts=None, is_predicted=False, max_trail=240):
+    """Live ball position + motion trail from release through delivery."""
     h, w = frame.shape[:2]
     if trail_pts and len(trail_pts) >= 2:
-        pts = [(int(p[0]), int(p[1])) for p in trail_pts[-16:]]
+        pts = [(int(p[0]), int(p[1])) for p in trail_pts[-max_trail:]]
         for i in range(1, len(pts)):
             if 0 <= pts[i][0] < w and 0 <= pts[i][1] < h:
-                cv2.line(frame, pts[i - 1], pts[i], (0, 220, 255), 2, cv2.LINE_AA)
+                fade = 0.35 + 0.65 * (i / max(len(pts) - 1, 1))
+                col = (0, int(220 * fade), int(255 * fade))
+                cv2.line(frame, pts[i - 1], pts[i], col, 2, cv2.LINE_AA)
     if coords is None:
         return
     cx, cy = int(coords[0]), int(coords[1])

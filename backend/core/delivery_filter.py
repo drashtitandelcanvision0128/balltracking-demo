@@ -95,7 +95,76 @@ def is_valid_delivery_track(
     return True
 
 
-def pending_delivery_confirmed(points: list, height: int, width: int = 0) -> bool:
+def ball_release_confirmed(
+    track: list[tuple[int, float, float, float]],
+    height: int,
+    width: int = 0,
+    fps: float = 30.0,
+) -> int | None:
+    """
+    Return the frame when the ball is actually released (starts flight).
+
+    Rejects ball-in-hand / run-up detections: needs forward flight motion and a
+    speed jump vs earlier (slower) points in the pending window.
+    """
+    from core.ball_detection_filters import is_landscape_frame
+
+    if len(track) < 4:
+        return None
+
+    pts = [(int(f), float(x), float(y)) for f, x, y, _ in track]
+    xy = [(x, y) for _, x, y in pts]
+    if not pending_delivery_confirmed(xy, height, width=width):
+        return None
+
+    speeds: list[tuple[int, float]] = []
+    for i in range(1, len(pts)):
+        f0, x0, y0 = pts[i - 1]
+        f1, x1, y1 = pts[i]
+        df = max(1, f1 - f0)
+        speeds.append((f1, math.hypot(x1 - x0, y1 - y0) / df))
+
+    if len(speeds) < 2:
+        return None
+
+    min_speed = max(5.0, height * 0.006)
+    f0, x0, y0 = pts[0]
+    _, x1, y1 = pts[-1]
+    dy = y1 - y0
+    min_dy = max(MIN_LOCK_DY_PX, height * 0.012)
+    landscape = width > 0 and is_landscape_frame(width, height)
+    if landscape:
+        if abs(x1 - x0) < max(8.0, width * 0.012) and abs(dy) < min_dy * 0.5:
+            return None
+    elif dy < min_dy * 0.65:
+        return None
+
+    early = [s for _, s in speeds[:-1]]
+    rel_f, rel_s = speeds[-1]
+    baseline = float(sorted(early)[len(early) // 2]) if early else 0.0
+
+    if rel_s < min_speed * 0.85:
+        return None
+    if baseline > 1.5 and rel_s < baseline * 1.22:
+        return None
+    if baseline <= 1.5 and rel_s < min_speed:
+        return None
+
+    areas = [float(a) for _, _, _, a in track if a > 0]
+    if len(areas) >= 4:
+        early_a = sum(areas[: len(areas) // 2]) / max(1, len(areas) // 2)
+        late_a = sum(areas[-2:]) / 2.0
+        if early_a > 0 and late_a > early_a * 1.15:
+            return None
+
+    min_after = max(2, int(fps * 0.06))
+    if rel_f - pts[0][0] < min_after:
+        return None
+
+    return rel_f
+
+
+def pending_delivery_confirmed(points: list, height: int, width: int = 0, det_conf: float = 0.0) -> bool:
     """Require visible motion before locking — rejects nuts/bolts and static false positives."""
     from core.ball_detection_filters import is_landscape_frame, in_ground_resting_band, in_machine_release_zone
 

@@ -7,6 +7,8 @@ myenv
 uploads/
 backend/uploads/
 *.mp4
+.env
+backend/.env
 
 __pycache__/
 *.pyc

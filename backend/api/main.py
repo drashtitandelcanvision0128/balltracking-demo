@@ -125,14 +125,6 @@ async def upload_video(
     with open(input_path, "wb") as f:
         f.write(content)
 
-    output_name = f"processed_{os.path.splitext(safe_name)[0]}.mp4"
-    output_path = os.path.join(ps.UPLOAD_FOLDER, output_name)
-
-    repo.update_session_status(session_id, "queued")
-    if session := repo.get_session(session_id):
-        session.video_path = input_path
-
-    job_id = str(uuid.uuid4())
     options: dict[str, Any] = {}
     if pitch_calibration:
         try:
@@ -143,6 +135,35 @@ async def upload_video(
         except Exception as exc:
             print(f"[PitchCalib] Invalid manual quad: {exc}")
 
+    if ps.AUTO_VIDEO_SETUP:
+        try:
+            from core.gpu_runtime import init_gpu_runtime
+            from core.video_auto_setup import save_video_profile, log_video_profile
+            dev, half, _ = init_gpu_runtime()
+            if ps.FULLY_AUTOMATIC and not options.get("manual_quad"):
+                from core.auto_pipeline import run_automatic_setup
+                profile, _, _ = run_automatic_setup(input_path, device=dev, half=half)
+            else:
+                from core.video_auto_setup import analyze_and_calibrate_video
+                profile = analyze_and_calibrate_video(
+                    input_path, manual_quad=options.get("manual_quad"),
+                )
+            save_video_profile(input_path, profile)
+            log_video_profile(profile)
+            options["video_profile"] = profile.to_dict()
+            if options.get("stabilize") is None:
+                options["stabilize"] = profile.stabilize
+        except Exception as exc:
+            print(f"[AutoSetup] skipped: {exc}")
+
+    output_name = f"processed_{os.path.splitext(safe_name)[0]}.mp4"
+    output_path = os.path.join(ps.UPLOAD_FOLDER, output_name)
+
+    repo.update_session_status(session_id, "queued")
+    if session := repo.get_session(session_id):
+        session.video_path = input_path
+
+    job_id = str(uuid.uuid4())
     with ps.jobs_lock:
         ps.jobs[job_id] = {
             "status": "queued",
@@ -151,6 +172,7 @@ async def upload_video(
             "session_id": session_id,
             "bowler_id": bowler_id,
             "queued_at": __import__("time").time(),
+            "video_profile": options.get("video_profile"),
         }
     ps.job_queue.put((job_id, input_path, output_path, options))
     ps._drain_queue_except(job_id)

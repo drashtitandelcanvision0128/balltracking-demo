@@ -111,19 +111,33 @@ def load_yolo_model(model_path: str):
     return model, half, device, gpu_name
 
 
-def infer_settings(ball_active: bool) -> dict:
+def _resolution_infer_boost(width: int, height: int, imgsz: int, max_dim: int) -> tuple[int, int]:
+    """Raise inference size on 4K/UHD so the ball stays large enough for YOLO."""
+    longest = max(int(width), int(height), 1)
+    if longest >= 3000:
+        floor_dim = int(_GPU_CFG.get("uhd_max_dim", 1920))
+        max_dim = max(max_dim, min(longest, floor_dim))
+        imgsz = max(imgsz, min(int(_GPU_CFG.get("uhd_imgsz", 1920)), longest))
+    elif longest >= 2000:
+        floor_dim = int(_GPU_CFG.get("hd_max_dim", 1600))
+        max_dim = max(max_dim, min(longest, floor_dim))
+        imgsz = max(imgsz, min(int(_GPU_CFG.get("hd_imgsz", 1600)), longest))
+    return imgsz, max_dim
+
+
+def infer_settings(ball_active: bool, width: int = 0, height: int = 0) -> dict:
     """Return imgsz / max_dim for current pipeline state."""
     if ball_active:
-        return {
-            "imgsz": int(_GPU_CFG.get("active_imgsz", 960)),
-            "max_dim": int(_GPU_CFG.get("active_max_dim", 960)),
-            "stride": 1,
-        }
-    return {
-        "imgsz": int(_GPU_CFG.get("waiting_imgsz", 640)),
-        "max_dim": int(_GPU_CFG.get("waiting_max_dim", 640)),
-        "stride": int(_GPU_CFG.get("waiting_stride", 3)),
-    }
+        imgsz = int(_GPU_CFG.get("active_imgsz", 960))
+        max_dim = int(_GPU_CFG.get("active_max_dim", 960))
+        stride = 1
+    else:
+        imgsz = int(_GPU_CFG.get("waiting_imgsz", 640))
+        max_dim = int(_GPU_CFG.get("waiting_max_dim", 640))
+        stride = int(_GPU_CFG.get("waiting_stride", 3))
+    if width > 0 and height > 0:
+        imgsz, max_dim = _resolution_infer_boost(width, height, imgsz, max_dim)
+    return {"imgsz": imgsz, "max_dim": max_dim, "stride": stride}
 
 
 def ffmpeg_encode_args(input_path: str, output_path: str) -> list[str]:

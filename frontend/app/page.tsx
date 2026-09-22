@@ -2,8 +2,8 @@
 import React, { useState, useRef, useCallback, useEffect } from 'react';
 import Link from 'next/link';
 import AnalyticsPanel from '../components/AnalyticsPanel';
-// import PitchCalibration, { type PitchPoint } from '../components/PitchCalibration';
-import { API_BASE, buildVideoUrl, buildReportPdfUrl, type Analytics, type BounceEvent, type DeliveryClip } from '../lib/api';
+import PitchCalibration, { type PitchPoint } from '../components/PitchCalibration';
+import { getApiBase, buildVideoUrl, buildDownloadUrl, buildReportPdfUrl, type Analytics, type BounceEvent, type DeliveryClip } from '../lib/api';
 
 interface Player {
   id: string;
@@ -38,7 +38,7 @@ const LENGTH_LABEL: Record<string, string> = {
 const CricketTrajectoryPredictor: React.FC = () => {
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [fileName, setFileName] = useState<string>('video.mp4');
-  const [statusText, setStatusText] = useState<string>('Ready. Select a video to detect pitch points.');
+  const [statusText, setStatusText] = useState<string>('Upload any cricket video — calibration, tracking, and analytics run automatically.');
   const [isProcessing, setIsProcessing] = useState<boolean>(false);
   const [isProcessed, setIsProcessed] = useState<boolean>(false);
   const [videoUrl, setVideoUrl] = useState<string>('');
@@ -68,7 +68,8 @@ const CricketTrajectoryPredictor: React.FC = () => {
   const [showDropdown, setShowDropdown] = useState<boolean>(false);
   const [selectedPlayer, setSelectedPlayer] = useState<Player | null>(null);
   const [isLiveActive, setIsLiveActive] = useState<boolean>(false);
-  // const [pitchCalibration, setPitchCalibration] = useState<PitchPoint[] | null>(null);
+  const [pitchCalibration, setPitchCalibration] = useState<PitchPoint[] | null>(null);
+  const [showManualCalibration, setShowManualCalibration] = useState<boolean>(false);
   const videoRef = useRef<HTMLVideoElement>(null);
   const liveVideoRef = useRef<HTMLVideoElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -179,7 +180,7 @@ const CricketTrajectoryPredictor: React.FC = () => {
     if (file) {
       setSelectedFile(file);
       setFileName(file.name);
-      setStatusText(`Selected: ${file.name}. Click 'Start Prediction'.`);
+      setStatusText(`Selected: ${file.name}. Click Start — no setup needed.`);
       setIsProcessed(false);
       setDeliveries([]);
       setClips([]);
@@ -191,7 +192,7 @@ const CricketTrajectoryPredictor: React.FC = () => {
       setReportPdfUrl('');
       setActiveJobId('');
       setProcessingMode('');
-      // setPitchCalibration(null);
+      setPitchCalibration(null);
       // Clear previous video URL
       if (videoUrl && videoUrl.startsWith('blob:')) {
         URL.revokeObjectURL(videoUrl);
@@ -310,7 +311,7 @@ const CricketTrajectoryPredictor: React.FC = () => {
     }
 
     setIsProcessing(true);
-    setStatusText('Uploading video to backend...');
+    setStatusText('Uploading video — auto-calibrating pitch, then marking bounce...');
 
     // Clean up old URL if exists
     if (videoUrl && videoUrl.startsWith('blob:')) {
@@ -323,12 +324,12 @@ const CricketTrajectoryPredictor: React.FC = () => {
 
     const formData = new FormData();
     formData.append('video', selectedFile);
-    // if (pitchCalibration && pitchCalibration.length === 4) {
-    //   formData.append('pitch_calibration', JSON.stringify(pitchCalibration));
-    // }
+    if (pitchCalibration && pitchCalibration.length === 4) {
+      formData.append('pitch_calibration', JSON.stringify(pitchCalibration));
+    }
 
     try {
-      const response = await fetch(`${API_BASE}/predict`, {
+      const response = await fetch(`${getApiBase()}/predict`, {
         method: 'POST',
         body: formData
       });
@@ -358,9 +359,15 @@ const CricketTrajectoryPredictor: React.FC = () => {
   const pollJob = (jobId: string) => {
     if (pollIntervalRef.current) clearInterval(pollIntervalRef.current);
 
+    let failCount = 0;
+    const MAX_POLL_FAILURES = 12;
+
     pollIntervalRef.current = setInterval(async () => {
       try {
-        const response = await fetch(`${API_BASE}/status/${jobId}`);
+        const response = await fetch(`${getApiBase()}/status/${jobId}`, {
+          signal: AbortSignal.timeout(15000),
+        });
+        failCount = 0;
         const data = await response.json();
 
         if (!response.ok || data.error) {
@@ -421,9 +428,16 @@ const CricketTrajectoryPredictor: React.FC = () => {
           }
         }
       } catch (error: any) {
-        if (pollIntervalRef.current) clearInterval(pollIntervalRef.current);
-        setStatusText('Polling failed: ' + error.message);
-        setIsProcessing(false);
+        failCount += 1;
+        if (failCount >= MAX_POLL_FAILURES) {
+          if (pollIntervalRef.current) clearInterval(pollIntervalRef.current);
+          setStatusText(
+            'Backend not reachable. Run: cd backend && ./run_gpu.ps1 — then upload again.'
+          );
+          setIsProcessing(false);
+          return;
+        }
+        setStatusText(`Waiting for backend... (${failCount}/${MAX_POLL_FAILURES})`);
       }
     }, 1000);
   };
@@ -453,33 +467,20 @@ const CricketTrajectoryPredictor: React.FC = () => {
     }
   };
 
-  const handleDownload = async () => {
+  const handleDownload = () => {
     if (!isProcessed || !downloadUrl) {
       setStatusText('No processed video available. Please upload and run prediction first.');
       return;
     }
-    
-    setStatusText('Preparing download...');
-    try {
-      const response = await fetch(downloadUrl);
-      if (!response.ok) throw new Error('Network response was not ok');
-      const blob = await response.blob();
-      const blobUrl = window.URL.createObjectURL(blob);
-      
-      const link = document.createElement('a');
-      link.href = blobUrl;
-      link.download = `predicted_${selectedFile?.name || 'pitch_points_video.mp4'}`;
-      document.body.appendChild(link);
-      link.click();
-      document.body.removeChild(link);
-      
-      window.URL.revokeObjectURL(blobUrl);
-      setStatusText('Download started: pitch point video.');
-    } catch (error) {
-      console.error('Download error:', error);
-      setStatusText('Download failed. Opening in new tab instead.');
-      window.open(downloadUrl, '_blank');
-    }
+    const url = buildDownloadUrl(downloadUrl);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `predicted_${selectedFile?.name || 'pitch_points_video.mp4'}`;
+    link.rel = 'noopener';
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    setStatusText('Download started: pitch point video.');
   };
 
   const formatTime = (seconds: number): string => {
@@ -678,9 +679,32 @@ const CricketTrajectoryPredictor: React.FC = () => {
                 )}
               </div>
 
-              {/* {selectedFile && videoUrl && !isProcessing && (
-                <PitchCalibration videoUrl={videoUrl} onChange={setPitchCalibration} />
-              )} */}
+              {selectedFile && videoUrl && !isProcessing && (
+                <div style={{ marginTop: 10 }}>
+                  <button
+                    type="button"
+                    onClick={() => setShowManualCalibration((v) => !v)}
+                    style={{
+                      padding: '6px 12px',
+                      background: 'transparent',
+                      color: '#8AA898',
+                      border: '1px solid #334',
+                      borderRadius: 4,
+                      cursor: 'pointer',
+                      fontSize: 12,
+                    }}
+                  >
+                    {showManualCalibration ? 'Hide manual calibration' : 'Advanced: manual pitch calibration (optional)'}
+                  </button>
+                  <p style={{ color: '#8AA898', fontSize: 12, marginTop: 8, lineHeight: 1.45 }}>
+                    Any video works. Pitch is auto-calibrated on upload. The bounce (tip) is marked
+                    as a red dot only inside the calibrated pitch area.
+                  </p>
+                  {showManualCalibration && (
+                    <PitchCalibration videoUrl={videoUrl} onChange={setPitchCalibration} />
+                  )}
+                </div>
+              )}
 
               <div style={styles.statusBar}>
                 <span style={styles.statusText}>{statusText}</span>

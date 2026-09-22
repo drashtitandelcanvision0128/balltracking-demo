@@ -114,6 +114,23 @@ def pitch_ground_y_at_x(vx: float, cam_quad: np.ndarray) -> float:
     return y0 + t * (y1 - y0)
 
 
+def point_in_calib_quad(
+    vx: float,
+    vy: float,
+    cam_quad: np.ndarray | None,
+    *,
+    margin_px: float = 28.0,
+) -> bool:
+    """True when (vx, vy) sits inside the auto-calibrated pitch quadrilateral."""
+    if cam_quad is None:
+        return True
+    quad = np.asarray(cam_quad, dtype=np.float32).reshape(4, 2)
+    # OpenCV expects TL, TR, BR, BL for a convex pitch strip
+    order = np.array([quad[0], quad[1], quad[3], quad[2]], dtype=np.float32)
+    dist = cv2.pointPolygonTest(order.reshape(-1, 1, 2), (float(vx), float(vy)), True)
+    return dist >= -float(margin_px)
+
+
 def snap_to_pitch_ground(
     vx: float,
     vy: float,

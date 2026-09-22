@@ -9,6 +9,7 @@ from typing import Any
 
 from accuracy_engine import score_hit as _heuristic_score_hit
 from accuracy_engine import score_hit_post_bounce as _heuristic_post_bounce
+from core.dl.pipeline import DeepLearningPipeline, is_dl_enabled
 
 
 def batsman_zone_from_pose(
@@ -69,6 +70,18 @@ def score_hit_enhanced(
     """
     Heuristic hit score + pose bat-zone proximity + dynamic batsman zone filter.
     """
+    if is_dl_enabled():
+        dl = DeepLearningPipeline.get()
+        dl.initialize()
+        dl_hit, dl_conf = dl.predict_hit(
+            raw_pts, hist_pts, height, fps, pose_frames=pose_frames,
+        )
+        if dl_conf >= 0.50:
+            y_min, y_max = batsman_zone_from_pose(pose_frames, height)
+            contact = (int(hist_pts[-1][0]), int(hist_pts[-1][1])) if hist_pts else None
+            if contact and y_min <= contact[1] / height <= y_max:
+                return dl_hit, dl_conf, contact if dl_hit else None
+
     y_min, y_max = batsman_zone_from_pose(pose_frames, height)
 
     if bounced and bounce_hist_idx is not None and frames_since_bounce >= 2:

@@ -4,7 +4,7 @@ import React, { useEffect, useState } from 'react';
 import Link from 'next/link';
 import PitchMapCanvas from '../../components/PitchMapCanvas';
 import AnalyticsPanel from '../../components/AnalyticsPanel';
-import { getAnalytics, getPitchmapData, API_BASE, type Analytics } from '../../lib/api';
+import { getAnalytics, getPitchmapData, getApiBase, type Analytics } from '../../lib/api';
 
 const ZONE_FILTERS = [
   { id: 'all', label: 'Overall' },
@@ -34,7 +34,7 @@ export default function AnalyticsPage() {
       setBounces(pitchData.bounces || []);
       setAnalytics(analyticsData);
       setHeatmapUrl(
-        `${API_BASE}/api/v1/heatmaps?zone_filter=${zoneFilter}&format=image${sessionId ? `&session_id=${sessionId}` : ''}`
+        `${getApiBase()}/api/v1/heatmaps?zone_filter=${zoneFilter}&format=image${sessionId ? `&session_id=${sessionId}` : ''}`
       );
     } catch {
       setBounces([]);

@@ -17,7 +17,6 @@ if _os.path.isdir(_venv_pkgs) and _venv_pkgs not in _sys.path:
 import math, os, threading, time, uuid, subprocess, warnings
 import cv2, numpy as np
 from collections import deque
-from scipy.interpolate import splprep, splev
 from flask import Flask, jsonify, request, send_file
 from flask_cors import CORS
 from ultralytics import YOLO
@@ -38,28 +37,58 @@ from accuracy_engine import (
 )
 from core.pitch_calibrator import calibrate_pitch_robust
 from core.ball_kalman import BallKalmanFilter, create_ball_kalman
-from core.homography import build_homography, is_on_pitch_map as homography_on_pitch, snap_to_pitch_ground
+from core.homography import (
+    build_homography, is_on_pitch_map as homography_on_pitch,
+    snap_to_pitch_ground, point_in_calib_quad,
+)
 from core.trajectory_physics import refine_bounce_world, interpolate_track_gaps, predict_bounce_landing
 from core.hit_detector import score_hit_enhanced
+from core.gemini_umpire import get_gemini_umpire
+from core.kinematic_engine import bounce_from_frame_track, detect_hit_deflection
 from core.config import CONFIG
 from core.pitch_coords import pitchmap_to_world, video_to_pitchmap
 from core.classifier import classify_bounce
 from core.gpu_runtime import init_gpu_runtime, load_yolo_model, infer_settings, ffmpeg_encode_args
+from core.video_auto_setup import (
+    analyze_and_calibrate_video, save_video_profile, log_video_profile,
+    calibration_from_profile, VideoProfile,
+)
 from core.pose_estimator import BatsmanPoseEstimator
 from core.delivery_filter import (
     can_start_new_delivery, should_register_marker, is_valid_delivery_track,
     MIN_NEW_DET_CONF, min_gap_frames,
-    pending_delivery_confirmed, track_is_static, STATIC_REJECT_PX,
+    pending_delivery_confirmed, ball_release_confirmed, track_is_static, STATIC_REJECT_PX,
 )
 from core.ball_detection_filters import (
     ball_candidate_ok, allow_ball_detection, in_batsman_approach_zone, in_bounce_ground_zone,
     ball_bbox_size_ok, is_ball_class, effective_bounce_ground_y_min, effective_approach_y_min,
-    in_machine_release_zone,
+    in_pitch_detection_zone, bounce_on_pitch,
+    in_machine_release_zone, trust_yolo_ball,
     is_landscape_frame, TRACK_DELIVERY_IN_FLIGHT, ball_area_limits, DETECT_PITCH_AREA_ONLY,
+    ball_lock_area_ok, find_colored_practice_ball, _inside_exclude_box,
 )
 from core.delivery_segmenter import segment_deliveries
 from core.speed_calibrator import compute_bowling_speed_kmh, session_speed_stats
 from core.video_stabilizer import VideoStabilizer, stabilization_config
+from core.flight_corridor import calibrate_flight_corridor
+from core.delivery_lane import DeliveryLane, find_first_bounce_between_ends
+from core.delivery_ball_gate import DELIVERY_BALL_ONLY, small_ball_area_ok
+from core.video_calibration import apply_video_zones, derive_zones_from_quad, zones_for_log, apply_player_pitch_calibration
+from core.auto_pipeline import run_automatic_setup
+from core.homography_recalibrator import HomographyRecalibrator
+from core.player_detector import PlayerScene, draw_player_labels
+from core.pipeline.bounce_engine import predict_bounce as predict_bounce_fusion
+from core.pipeline.session_tracker import SessionTracker
+from core.pipeline.annotator import annotate_frame
+from core.pipeline.trajectory_predictor import predict_future_path
+from core.pipeline.visualizer import draw_bounce_marker, draw_trajectory
+from core.pipeline.first_pitch_point import (
+    PitchPointMarker, find_pitch_ground_touch, find_bounce_reversal_point,
+    draw_pitch_point_markers, _parse_det_track,
+)
+from core.dl.pipeline import apply_dl_config_overrides, DeepLearningPipeline, is_dl_enabled
+
+apply_dl_config_overrides()
 
 _TRACK = CONFIG.get('tracking', {})
 COAST_SECONDS = float(_TRACK.get('coast_seconds', 0.45))
@@ -67,8 +96,33 @@ _FILT_CFG = CONFIG.get('delivery_filter', {})
 PENDING_CLEAR_SEC = float(_FILT_CFG.get('pending_clear_sec', 0.65))
 
 
-def _coast_limit_frames(fps: float) -> int:
-    return max(12, int(fps * COAST_SECONDS))
+def _coast_limit_frames(fps: float, seconds: float | None = None) -> int:
+    sec = COAST_SECONDS if seconds is None else seconds
+    return max(12, int(fps * sec))
+
+
+def _watch_tracking_settings(fps: float) -> dict:
+    """Release → end: machine lock, longer coast, delayed delivery reset."""
+    watch = _PROC.get("watch_from_release", {})
+    enabled = bool(watch.get("enabled", True))
+    if not enabled:
+        return {
+            "enabled": False,
+            "require_machine_lock": False,
+            "coast_limit": _coast_limit_frames(fps),
+            "delivery_lost_frames": max(18, int(fps * 0.75)),
+            "gap_finalize_frames": max(12, int(fps * 0.45)),
+            "post_bounce_frames": max(8, int(fps * 0.4)),
+        }
+    coast_sec = float(watch.get("coast_seconds", 0.90))
+    return {
+        "enabled": True,
+        "require_machine_lock": bool(watch.get("require_machine_lock", True)),
+        "coast_limit": _coast_limit_frames(fps, coast_sec),
+        "delivery_lost_frames": max(18, int(fps * float(watch.get("delivery_lost_sec", 1.35)))),
+        "gap_finalize_frames": max(15, int(fps * float(watch.get("gap_finalize_sec", 1.20)))),
+        "post_bounce_frames": max(10, int(fps * float(watch.get("post_bounce_watch_sec", 0.55)))),
+    }
 
 API_VERSION = 'pitchmap-v36-accuracy-upgrade'
 _GPU_CFG = CONFIG.get('gpu', {})
@@ -87,8 +141,15 @@ SHOW_CORNER_PITCH_MAP = bool(_VIZ.get('show_corner_pitch_map', False))
 SHOW_SUMMARY_PITCH_MAP = bool(_VIZ.get('show_summary_pitch_map', False))
 SHOW_PITCH_ZONE_OVERLAY = bool(_VIZ.get('show_pitch_zone_overlay', False))
 SHOW_PREDICTIONS = bool(_VIZ.get('show_predictions', True))
+SHOW_BALL_TRACK = bool(_VIZ.get('show_ball_track', False))
+SHOW_BOUNCE_PREDICTION = bool(_VIZ.get('show_bounce_prediction', False))
+SHOW_FULL_TRAJECTORY = bool(_VIZ.get('show_full_trajectory', False))
+SHOW_FUTURE_PATH = bool(_VIZ.get('show_future_path', False))
+SHOW_PITCH_BOUNCE_DOT_ONLY = bool(_VIZ.get('show_pitch_bounce_dot_only', True))
+SHOW_CALIB_PITCH_OUTLINE = bool(_VIZ.get('show_calib_pitch_outline', True))
 TRAIL_LENGTH = int(_VIZ.get('trail_length', 16))
 _PROC = CONFIG.get('processing', {})
+BOUNCE_DIRECTION_MIN_CONF = float(_PROC.get('bounce_direction_min_confidence', 0.52))
 BOUNCE_GROUND_Y_MIN = float(_PROC.get('bounce_ground_y_min', 0.65))
 BOUNCE_MIN_TRACK_FRAMES = int(_PROC.get('bounce_min_track_frames', 10))
 BOUNCE_LOOKBACK_FRAMES = int(_PROC.get('bounce_lookback_frames', 40))
@@ -101,10 +162,32 @@ BOUNCE_MIN_SECONDS_AFTER_LOCK = float(_PROC.get('bounce_min_seconds_after_lock',
 BOUNCE_MIN_DIST_FROM_LOCK_RATIO = float(_PROC.get('bounce_min_dist_from_lock_ratio', 0.12))
 BOUNCE_PREDICT_MIN_FRAMES = int(_PROC.get('bounce_predict_min_frames', 6))
 BOUNCE_REFINE_ENABLED = bool(_PROC.get('bounce_refine_enabled', False))
+BOUNCE_DOT_ONLY = bool(_PROC.get('bounce_dot_only', True))
+BOUNCE_MARK_MODE = str(_PROC.get('bounce_mark_mode', 'first_lowest')).strip().lower()
+BALL_ONLY_PIPELINE = bool(_PROC.get('ball_only_pipeline', False))
+RELEASE_LOCK_CONF = float(_PROC.get('release_lock_conf', 0.22))
+BOUNCE_FRAMES_AFTER_CONTACT = int(_PROC.get('bounce_frames_after_contact', 5))
+AUTO_VIDEO_SETUP = bool(_PROC.get('auto_video_setup', True))
+FULLY_AUTOMATIC = bool(_PROC.get('fully_automatic', {}).get('enabled', True))
+SHOW_PLAYER_LABELS = bool(_PROC.get('fully_automatic', {}).get('show_player_labels', False))
 CLIP_BY_CLIP = bool(_PROC.get('clip_by_clip', False))
 CLIP_MODE = str(_PROC.get('clip_mode', 'stream'))  # stream | clip
 STREAM_DETECT_EVERY_FRAME = bool(_PROC.get('stream_detect_every_frame', True))
 CLIP_DEEP_IMGSZ = int(_PROC.get('clip_deep_imgsz', 1280))
+_GEMINI_CFG = CONFIG.get('gemini', {})
+DEEP_LEARNING_ENABLED = is_dl_enabled()
+
+def _apply_min_infer_scale(scale: float) -> float:
+    """Keep enough resolution for small cricket balls on 4K/UHD."""
+    sb = _PROC.get('small_ball_detect', {})
+    if sb.get('enabled', True):
+        return max(scale, float(sb.get('min_infer_scale', 0.72)))
+    return scale
+
+def _ball_area_passes(area: float, height: int, width: int) -> bool:
+    if DELIVERY_BALL_ONLY:
+        return small_ball_area_ok(area, height, width)
+    return ball_bbox_size_ok(area, height, width)
 
 _yolo_model = None
 _yolo_half = False
@@ -119,6 +202,26 @@ def _get_yolo():
         _yolo_model, _yolo_half, _yolo_device, _gpu_name = load_yolo_model(MODEL_PATH)
         print(f"[YOLO] device={_yolo_device} half={_yolo_half} gpu={_gpu_name or 'none'}")
     return _yolo_model, _yolo_half, _yolo_device
+
+def _video_infer_settings(ball_active: bool, width: int, height: int, profile=None) -> dict:
+    base = infer_settings(ball_active, width, height)
+    if profile is None:
+        return base
+    if isinstance(profile, dict):
+        profile = VideoProfile(**profile)
+    imgsz = profile.infer_active_imgsz if ball_active else profile.infer_waiting_imgsz
+    return {"imgsz": imgsz, "max_dim": profile.infer_max_dim, "stride": base["stride"]}
+
+
+def _profile_as_video_profile(profile) -> VideoProfile | None:
+    if profile is None:
+        return None
+    if isinstance(profile, VideoProfile):
+        return profile
+    if isinstance(profile, dict):
+        return VideoProfile(**profile)
+    return None
+
 
 def _set_job_progress(job_id, pct, frame_idx=0, total=0, pass_info=None):
     if not job_id:
@@ -154,7 +257,9 @@ def _log(msg: str) -> None:
 
 def _yolo_predict(model, frame, **kwargs):
     """Run YOLO without flooding the terminal with deprecation warnings."""
+    kwargs.pop("half", None)  # avoid ultralytics half/quantize deprecation spam
     with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
         warnings.filterwarnings("ignore", message=".*half.*deprecated.*")
         warnings.filterwarnings("ignore", category=UserWarning, module="ultralytics")
         return model.predict(frame, verbose=False, **kwargs)
@@ -444,13 +549,23 @@ def _add_delivery_marker(bx, by, h_matrix, label, frame_index,
         tracking_confidence=tracking_conf,
         full_toss=full_toss,
     )
+    length_type = classification.length_type
+    if DEEP_LEARNING_ENABLED:
+        dl_pipe = DeepLearningPipeline.get()
+        dl_pipe.initialize()
+        dl_len, dl_conf = dl_pipe.classify_length(x_m, y_m)
+        if dl_len and dl_conf >= 0.45:
+            length_type = dl_len
     length_zone = classification.length_legacy
+    if length_type != classification.length_type:
+        from core.classifier import _LENGTH_LEGACY
+        length_zone = _LENGTH_LEGACY.get(length_type, length_zone)
     speed_kmh = round(float(speed_kmh or 0), 0)
     bounce_entry = {
         'coords': (px_map, py_map),
         'type': label,
         'length': length_zone,
-        'length_type': classification.length_type,
+        'length_type': length_type,
         'line_type': classification.line_type,
         'bounce_x': classification.bounce_x,
         'bounce_y': classification.bounce_y,
@@ -633,14 +748,206 @@ def _resolve_batsman_miss(raw_pts, hist, height, hit_occurred, bounced, y_max_va
     return classify_miss(pts, height, hit_occurred, bounced, batsman_y_max=y_max_val)
 
 
+def _mark_track_for_delivery(det_frame_history, current_delivery_track, release_frame):
+    """Bounce uses YOLO detections only — never Kalman coast points."""
+    det = _parse_det_track([p for p in det_frame_history if p[0] >= release_frame])
+    if len(det) >= 4:
+        return det
+    return []
+
+
+def _gemini_frames_near(ring: deque, frame_index: int, window: int = 4) -> list:
+    """3–4 frames around batsman contact for Gemini verify (PDF Module 3)."""
+    if not ring:
+        return []
+    picked = [f for idx, f in ring if abs(idx - frame_index) <= window]
+    n = int(_GEMINI_CFG.get("verify_frames", 3))
+    return picked[-n:]
+
+
+def _gemini_review_hit_miss(
+    gemini_umpire,
+    frame_ring: deque,
+    frame_index: int,
+    *,
+    heuristic_hit: bool,
+    heuristic_miss: bool,
+    heuristic_conf: float,
+    ball_xy: tuple[int, int] | None = None,
+    height: int = 1080,
+    width: int = 1920,
+) -> tuple[bool, bool, float, str] | None:
+    """Module 3: Gemini bat-ball contact verify only (not bounce/tracking)."""
+    if gemini_umpire is None or not gemini_umpire.available:
+        return None
+    frames = _gemini_frames_near(frame_ring, frame_index)
+    if not frames:
+        return None
+    verdict = gemini_umpire.verify_bat_ball_contact(
+        frames,
+        ball_xy=ball_xy,
+        height=height,
+        width=width,
+        heuristic_hit=heuristic_hit,
+        heuristic_miss=heuristic_miss,
+        heuristic_conf=heuristic_conf,
+    )
+    if verdict is None or verdict.confidence < gemini_umpire.min_confidence:
+        return None
+    return verdict.hit, verdict.miss, verdict.confidence, verdict.reason
+
+
+def _try_mark_first_pitch_point(
+    track_pts, release_frame, height, delivery_id, pitch_point_markers, delivery_marked,
+    *, cam_quad=None, width=0, det_frame_history=None, fps=30.0, h_matrix=None,
+    delivery_lane: DeliveryLane | None = None,
+):
+    """
+    First bounce on pitch between bowler/machine end and batsman end (delivery lane).
+    """
+    if delivery_marked or release_frame < 0:
+        return delivery_marked
+    if det_frame_history is not None:
+        track_pts = _mark_track_for_delivery(det_frame_history, track_pts, release_frame)
+    min_pts = 4 if BALL_ONLY_PIPELINE else 5
+    if len(track_pts) < min_pts:
+        return delivery_marked
+
+    result = None
+    source = "ground_contact"
+
+    rev = find_bounce_reversal_point(
+        track_pts, release_frame,
+        height=height, width=width, fps=fps,
+        cam_quad=cam_quad, h_matrix=h_matrix,
+    )
+    if rev is not None:
+        f, x, y, _release_used = rev
+        result = (f, x, y)
+        source = "ground_contact"
+
+    if result is None and delivery_lane is not None:
+        result = find_first_bounce_between_ends(
+            track_pts, release_frame, delivery_lane,
+            height=height, width=width, fps=fps, h_matrix=h_matrix,
+        )
+        if result is not None:
+            source = "lane_bounce"
+
+    if result is None:
+        return delivery_marked
+
+    f, x, y = result
+
+    min_after = max(6, int(fps * BOUNCE_MIN_SECONDS_AFTER_LOCK))
+    if f < release_frame + min_after:
+        return delivery_marked
+
+    # Keep the real ball-floor contact. Do not snap onto a calibration rectangle.
+    for m in pitch_point_markers:
+        if abs(m.x - x) < 18 and abs(m.y - y) < 18:
+            return True
+
+    pitch_point_markers.append(PitchPointMarker(frame=int(f), x=float(x), y=float(y), delivery_id=delivery_id))
+    _log(
+        f"[Frame {f}] Bounce @ ({int(x)}, {int(y)}) | source={source} "
+        f"release f={release_frame} delivery #{delivery_id}"
+    )
+    return True
+
+
+def _draw_calib_pitch_outline(frame, cam_quad) -> None:
+    """Draw auto-calibrated pitch bounce area so the red dot sits on a visible region."""
+    if cam_quad is None:
+        return
+    import cv2
+    quad = np.asarray(cam_quad, dtype=np.int32).reshape(4, 2)
+    poly = np.array([quad[0], quad[1], quad[3], quad[2]], dtype=np.int32)
+    overlay = frame.copy()
+    cv2.fillPoly(overlay, [poly], (40, 90, 40))
+    cv2.addWeighted(overlay, 0.12, frame, 0.88, 0, frame)
+    cv2.polylines(frame, [poly], True, (80, 220, 120), 2, cv2.LINE_AA)
+
+
+def _draw_bounce_dots(frame, pitch_point_markers, session_tracker=None, frame_index=0, cam_quad=None):
+    """Red dots at actual ball bounce (ground contact) only."""
+    from core.pipeline.first_pitch_point import draw_pitch_point_markers
+
+    if SHOW_CALIB_PITCH_OUTLINE:
+        _draw_calib_pitch_outline(frame, cam_quad)
+    draw_pitch_point_markers(frame, pitch_point_markers)
+
+
+def _merge_session_bounces_to_markers(
+    session_tracker, pitch_point_markers, delivery_counter, *, delivery_lock_frame=-1,
+    width=0, height=0, h_matrix=None,
+):
+    """Fallback when YOLO lane bounce math finds nothing."""
+    known = {(m.frame, round(m.x), round(m.y)) for m in pitch_point_markers}
+    for i, bounce in enumerate(session_tracker.locked_bounces):
+        if delivery_lock_frame >= 0 and bounce.bounce_frame <= delivery_lock_frame:
+            continue
+        on_pitch = True
+        if width > 0:
+            on_pitch = bounce_on_pitch(
+                int(bounce.image_x), int(bounce.image_y), width, height, h_matrix,
+            ) or in_pitch_detection_zone(
+                int(bounce.image_x), int(bounce.image_y), width, height, h_matrix,
+                allow_flight_above=True, strict=False,
+            )
+        if not on_pitch and len(pitch_point_markers) > 0:
+            continue
+        key = (bounce.bounce_frame, round(bounce.image_x), round(bounce.image_y))
+        if key in known:
+            continue
+        pitch_point_markers.append(PitchPointMarker(
+            frame=int(bounce.bounce_frame),
+            x=float(bounce.image_x),
+            y=float(bounce.image_y),
+            delivery_id=max(1, delivery_counter),
+        ))
+        known.add(key)
+        _log(
+            f"[Frame {bounce.bounce_frame}] Bounce @ ({int(bounce.image_x)}, {int(bounce.image_y)}) "
+            f"| source=session delivery #{delivery_counter}"
+        )
+
+
+def _sync_pitch_marks_to_results(
+    pitch_point_markers, h_matrix, job_bounces, session_bounces,
+    persistent_video_bounces, fps=25.0,
+):
+    """Copy ground-touch markers into job_bounces so API/PDF show correct delivery count."""
+    if not pitch_point_markers:
+        return
+    known_frames = {b.get('frame') for b in job_bounces}
+    for m in pitch_point_markers:
+        if m.frame in known_frames:
+            continue
+        _add_delivery_marker(
+            int(m.x), int(m.y), h_matrix, 'DOTS', int(m.frame),
+            job_bounces, session_bounces, persistent_video_bounces,
+            fps=fps, last_marker_frame=-9999, strict=False,
+        )
+        known_frames.add(m.frame)
+    if pitch_point_markers:
+        _log(f"[Results] synced {len(pitch_point_markers)} pitch marks → {len(job_bounces)} deliveries")
+
+
 def _finalize_delivery(raw_pts, height, h_matrix, frame_index, hit_occurred, event_status,
                        bounced_this_delivery, job_bounces, session_bounces,
                        persistent_video_bounces, fps, last_marker_frame, last_detection_conf=0.5,
-                       post_hit_max_speed=0.0, hist_pts=None, y_max_val=0.92, det_pts=None, width=0):
+                       post_hit_max_speed=0.0, hist_pts=None, y_max_val=0.92, det_pts=None, width=0,
+                       lock_frame=-1, lock_pt=None, cam_quad=None):
     """
-    End one delivery — register DOT if no bounce yet, then close.
-    Ensures every tracked ball gets a RUN or DOT marker when possible.
+    End one delivery — Phase 2 bounce dot from full track if not marked yet.
     """
+    if BOUNCE_MARK_MODE == 'first_lowest':
+        if not hit_occurred and _resolve_batsman_miss(
+                raw_pts, hist_pts, height, hit_occurred, bounced_this_delivery, y_max_val):
+            pass
+        return last_marker_frame
+
     bounce_pts = list(det_pts) if det_pts is not None else list(raw_pts)
     bounced = bounced_this_delivery
     if not hit_occurred and _resolve_batsman_miss(
@@ -650,17 +957,37 @@ def _finalize_delivery(raw_pts, height, h_matrix, frame_index, hit_occurred, eve
             _relable_last_bounce(job_bounces, session_bounces, persistent_video_bounces,
                                  'WICKETS', hit=False)
 
+    if not bounced and len(bounce_pts) >= BOUNCE_MIN_TRACK_FRAMES:
+        pt = predict_pitch_bounce_from_track(
+            bounce_pts, frame_index, -9999, fps, h_matrix, persistent_video_bounces,
+            height, width=width, lock_frame=lock_frame, lock_pt=lock_pt, cam_quad=cam_quad,
+            min_frames_after_bounce=2,
+        )
+        if pt is not None:
+            bx, by = pt
+            speed = _compute_delivery_speed(bounce_pts, fps, height, h_matrix)
+            result = _add_delivery_marker(
+                bx, by, h_matrix, 'DOTS', frame_index,
+                job_bounces, session_bounces, persistent_video_bounces,
+                speed_kmh=speed, raw_pts=bounce_pts, height=height, fps=fps,
+                last_marker_frame=last_marker_frame, strict=False)
+            if result[0] is not None:
+                last_marker_frame = result[1]
+                bounced = True
+
     if not bounced and not hit_occurred and len(bounce_pts) >= BOUNCE_MIN_TRACK_FRAMES:
-        last_marker_frame, registered = _register_dot_from_track(
-            bounce_pts, height, h_matrix, frame_index, job_bounces, session_bounces,
-            persistent_video_bounces, fps, last_marker_frame, last_detection_conf, width=width)
-        if registered:
-            bounced = True
-    last_marker_frame = _close_delivery(
-        bounce_pts, height, h_matrix, frame_index, hit_occurred, event_status, bounced,
-        job_bounces, session_bounces, persistent_video_bounces,
-        fps=fps, last_marker_frame=last_marker_frame, post_hit_max_speed=post_hit_max_speed,
-        width=width)
+        if not BOUNCE_DOT_ONLY:
+            last_marker_frame, registered = _register_dot_from_track(
+                bounce_pts, height, h_matrix, frame_index, job_bounces, session_bounces,
+                persistent_video_bounces, fps, last_marker_frame, last_detection_conf, width=width)
+            if registered:
+                bounced = True
+    if not BOUNCE_DOT_ONLY:
+        last_marker_frame = _close_delivery(
+            bounce_pts, height, h_matrix, frame_index, hit_occurred, event_status, bounced,
+            job_bounces, session_bounces, persistent_video_bounces,
+            fps=fps, last_marker_frame=last_marker_frame, post_hit_max_speed=post_hit_max_speed,
+            width=width)
     return last_marker_frame
 
 
@@ -743,31 +1070,30 @@ def _compute_bounce_prediction(det_pts, h_matrix, h_inv, fps, height, width=0):
     return pred
 
 
-def _try_detect_bounce(raw_pts, frame_index, last_bounce_frame, fps, h_matrix, persistent_video_bounces, height, width=0, lock_frame=-1, lock_pt=None, cam_quad=None):
+def predict_pitch_bounce_from_track(
+    raw_pts, frame_index, last_bounce_frame, fps, h_matrix, persistent_video_bounces,
+    height, width=0, lock_frame=-1, lock_pt=None, cam_quad=None, *, min_frames_after_bounce=None,
+):
     """
-    Register bounce only on real YOLO detections: deepest pitch contact (max Y) with rise after.
+    Phase 2 — predict pitch bounce dot ONLY after Phase 1 tracking has passed the bounce.
+    Analyses the full detection track; marks dot at pitch contact X/Y (snapped to turf).
     """
-    from core.delivery_filter import track_is_static, is_valid_delivery_track
+    from core.delivery_filter import is_valid_delivery_track
     from core.ball_detection_filters import is_landscape_frame
 
-    min_pts = max(18, BOUNCE_MIN_TRACK_FRAMES)
+    min_pts = max(14, BOUNCE_MIN_TRACK_FRAMES)
     if len(raw_pts) < min_pts:
         return None
     if lock_frame >= 0:
-        min_after_lock = max(20, int(fps * BOUNCE_MIN_SECONDS_AFTER_LOCK))
+        min_after_lock = max(14, int(fps * BOUNCE_MIN_SECONDS_AFTER_LOCK))
         if frame_index - lock_frame < min_after_lock:
             return None
     if frame_index - last_bounce_frame <= max(6, int(fps * 0.25)):
         return None
-    if track_is_static(raw_pts[-max(6, BOUNCE_MIN_TRACK_FRAMES):]):
-        print("[Bounce] REJECTED: Static track (not a moving ball)")
-        return None
     if not is_valid_delivery_track(raw_pts, height, fps, strict=False, width=width):
-        print("[Bounce] REJECTED: Track lacks real delivery motion")
         return None
 
     lookback = len(raw_pts)
-    bounce_y_min = effective_bounce_ground_y_min(width, height) if width > 0 else BOUNCE_GROUND_Y_MIN
     bounce_kwargs = _bounce_confirm_kwargs(width, height)
     if lock_pt is not None:
         bounce_kwargs['lock_pt'] = lock_pt
@@ -775,6 +1101,16 @@ def _try_detect_bounce(raw_pts, frame_index, last_bounce_frame, fps, h_matrix, p
         bounce_kwargs['cam_quad'] = cam_quad
     bounce_pt = confirm_pitch_bounce(raw_pts, height, lookback=lookback, **bounce_kwargs)
     if bounce_pt is None:
+        return None
+
+    bounce_idx = find_hist_index_near(raw_pts, bounce_pt)
+    if bounce_idx is None:
+        return None
+    need_after = min_frames_after_bounce
+    if need_after is None:
+        need_after = max(BOUNCE_FRAMES_AFTER_CONTACT, int(fps * 0.08))
+    frames_past_bounce = len(raw_pts) - 1 - bounce_idx
+    if frames_past_bounce < need_after:
         return None
 
     if BOUNCE_REFINE_ENABLED and h_matrix is not None:
@@ -785,17 +1121,15 @@ def _try_detect_bounce(raw_pts, frame_index, last_bounce_frame, fps, h_matrix, p
                 bounce_pt = refined
 
     bx, by = bounce_pt
+    bounce_y_min = effective_bounce_ground_y_min(width, height) if width > 0 else BOUNCE_GROUND_Y_MIN
     if cam_quad is not None:
         snapped = snap_to_pitch_ground(bx, by, cam_quad, height)
         if snapped is None:
-            print(f"[Bounce] REJECTED: In air above pitch (by={by:.0f})")
             return None
         bx, by = snapped
 
-    bounce_idx = find_hist_index_near(raw_pts, (bx, by))
-    min_bounce_idx = max(18, int(len(raw_pts) * BOUNCE_SKIP_RELEASE_RATIO))
-    if bounce_idx is not None and bounce_idx < min_bounce_idx:
-        print(f"[Bounce] REJECTED: Too early (idx={bounce_idx}, need>={min_bounce_idx}) — release phase")
+    min_bounce_idx = max(12, int(len(raw_pts) * BOUNCE_SKIP_RELEASE_RATIO))
+    if bounce_idx < min_bounce_idx:
         return None
     if lock_pt is not None:
         lx, ly = lock_pt
@@ -804,44 +1138,42 @@ def _try_detect_bounce(raw_pts, frame_index, last_bounce_frame, fps, h_matrix, p
         if width > 0 and is_landscape_frame(width, height):
             min_dist = max(min_dist, width * 0.11)
         if dist < min_dist:
-            print(f"[Bounce] REJECTED: Too close to release ({dist:.0f}px < {min_dist:.0f}px)")
             return None
     release_y = lock_pt[1] if lock_pt is not None else raw_pts[0][1]
     if by < release_y + height * 0.08:
-        print(f"[Bounce] REJECTED: Still near release (by={by:.0f}, release_y={release_y:.0f})")
         return None
     if not in_bounce_ground_zone(by, height, width):
-        print(f"[Bounce] REJECTED: Still in air (by={by:.0f}, need>={height * bounce_y_min:.0f})")
         return None
 
     travel = math.hypot(raw_pts[-1][0] - raw_pts[0][0], raw_pts[-1][1] - raw_pts[0][1])
     y_span = max(p[1] for p in raw_pts) - min(p[1] for p in raw_pts)
     min_travel = height * (0.04 if width > height * 1.12 else 0.06)
     if travel < min_travel and y_span < min_travel:
-        print(f"[Bounce] REJECTED: Insufficient bowler→batsman travel (span={travel:.0f}px)")
         return None
 
-    print(f"[Bounce] X-axis pitch touch toward batsman @ ({bx:.0f}, {by:.0f})")
-
     if not (height * bounce_y_min <= by < height * 0.88):
-        print(f"[Bounce] REJECTED: Outside vertical zone (by={by:.0f})")
         return None
 
     if h_matrix is not None:
         px, py = video_to_pitchmap(bx, by, h_matrix)
-        print(f"[Bounce] Pitchmap: ({px:.1f}, {py:.1f})")
         if not (150 <= py <= 700):
-            print(f"[Bounce] REJECTED: Outside pitch (py={py:.1f})")
             return None
 
     if persistent_video_bounces:
         min_dist = min(math.hypot(bx - b['coords'][0], by - b['coords'][1]) for b in persistent_video_bounces)
         if min_dist < 25:
-            print(f"[Bounce] REJECTED: Duplicate (dist={min_dist:.0f})")
             return None
 
-    print(f"[Bounce] ACCEPTED @ ({bx:.0f}, {by:.0f})")
+    print(f"[Bounce] Phase 2 — pitch dot from track @ ({bx:.0f}, {by:.0f}) idx={bounce_idx}/{len(raw_pts)}")
     return (bx, by)
+
+
+def _try_detect_bounce(raw_pts, frame_index, last_bounce_frame, fps, h_matrix, persistent_video_bounces, height, width=0, lock_frame=-1, lock_pt=None, cam_quad=None):
+    """Alias — track first, then predict bounce on pitch."""
+    return predict_pitch_bounce_from_track(
+        raw_pts, frame_index, last_bounce_frame, fps, h_matrix, persistent_video_bounces,
+        height, width=width, lock_frame=lock_frame, lock_pt=lock_pt, cam_quad=cam_quad,
+    )
 
 
 def _clips_to_dicts(clips) -> list[dict]:
@@ -923,7 +1255,8 @@ def _synthetic_clips_from_bounces(bounce_events: list[dict], total_frames: int, 
 
 def _yolo_detect_ball(model, frame, width, height, conf_thresh, detect_imgsz, infer_scale_run,
                       use_half, yolo_device, kf=None, frames_since_det=0, coast_limit=18,
-                      last_velocity=0.0, raw_history=None, post_contact=False, h_matrix=None):
+                      last_velocity=0.0, raw_history=None, post_contact=False, h_matrix=None,
+                      flight_corridor=None):
     """YOLO ball detection with optional Kalman proximity scoring."""
     best_coords = None
     best_score = -float('inf')
@@ -939,7 +1272,7 @@ def _yolo_detect_ball(model, frame, width, height, conf_thresh, detect_imgsz, in
     results = _yolo_predict(
         model,
         infer_frame, conf=conf_thresh, imgsz=detect_imgsz, max_det=10,
-        half=use_half, device=yolo_device,
+        device=yolo_device,
         augment=False, stream=False,
     )
     for box in results[0].boxes:
@@ -948,16 +1281,9 @@ def _yolo_detect_ball(model, frame, width, height, conf_thresh, detect_imgsz, in
         x1, y1, x2, y2 = box.xyxy[0].tolist()
         bw, bh = (x2 - x1) * inv, (y2 - y1) * inv
         area = bw * bh
-        if not ball_bbox_size_ok(area, height, width):
+        if not _ball_area_passes(area, height, width):
             continue
         cx, cy = int((x1 + x2) / 2 * inv), int((y1 + y2) / 2 * inv)
-        aspect = bw / (bh + 1e-5)
-        round_ok = 0.75 < aspect < 1.35
-        if not round_ok and not in_machine_release_zone(cx, cy, width, height):
-            continue
-        if not round_ok and not (0.55 < aspect < 1.65):
-            continue
-
         ix1, iy1 = max(0, int(x1 * inv)), max(0, int(y1 * inv))
         ix2, iy2 = min(width, int(x2 * inv)), min(height, int(y2 * inv))
         roi = frame[iy1:iy2, ix1:ix2] if ix2 > ix1 and iy2 > iy1 else None
@@ -967,6 +1293,8 @@ def _yolo_detect_ball(model, frame, width, height, conf_thresh, detect_imgsz, in
                 track_active=bool(kf and kf.initialized),
                 recent_points=list(raw_history) if raw_history else [],
                 h_matrix=h_matrix,
+                flight_corridor=flight_corridor,
+                area=area,
         ):
             continue
 
@@ -1006,15 +1334,16 @@ def _yolo_detect_ball(model, frame, width, height, conf_thresh, detect_imgsz, in
 def track_delivery_clip(cap, clip, model, fps, width, height, h_matrix, h_inv, dt,
                         use_half, yolo_device, job_bounces, session_bounces,
                         persistent_video_bounces, last_marker_frame, clip_index=1,
-                        stump_scale=1.0, cam_quad=None):
+                        stump_scale=1.0, cam_quad=None, flight_corridor=None):
     """
     Pass 2 — high-accuracy tracking on one delivery clip.
     Fresh Kalman per clip, stride=1 on every frame, larger imgsz.
     """
     cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, clip.start - 1))
     coast_limit = _coast_limit_frames(fps)
-    detect_imgsz = min(1280, max(CLIP_DEEP_IMGSZ, max(width, height)))
-    infer_scale_run = min(1.0, INFER_MAX_DIM_ACTIVE / max(width, height, 1))
+    gpu_infer = infer_settings(True, width, height)
+    detect_imgsz = gpu_infer['imgsz']
+    infer_scale_run = _apply_min_infer_scale(min(1.0, gpu_infer['max_dim'] / max(width, height, 1)))
     conf_thresh = CONFIG['model']['confidence']
 
     kf = create_ball_kalman(fps)
@@ -1059,6 +1388,7 @@ def track_delivery_clip(cap, clip, model, fps, width, height, h_matrix, h_inv, d
                 raw_history=raw_history,
                 post_contact=bounced_this_delivery or hit_occurred,
                 h_matrix=h_matrix,
+                flight_corridor=flight_corridor,
             )
 
         if best_coords is not None:
@@ -1135,14 +1465,14 @@ def track_delivery_clip(cap, clip, model, fps, width, height, h_matrix, h_inv, d
             frames_since_bounce += 1
 
         current_bounce_prediction = None
-        if event_status == "BOWLED" and not bounced_this_delivery and not hit_occurred:
+        if not BOUNCE_DOT_ONLY and event_status == "BOWLED" and not bounced_this_delivery and not hit_occurred:
             current_bounce_prediction = _compute_bounce_prediction(
                 det_list, h_matrix, h_inv, fps, height, width=width)
             if current_bounce_prediction is not None:
                 last_bounce_prediction = current_bounce_prediction
 
-        if event_status == "BOWLED" and not bounced_this_delivery and not hit_occurred:
-            bounce_pt = _try_detect_bounce(
+        if event_status == "BOWLED" and not bounced_this_delivery and not hit_occurred and kf.initialized:
+            bounce_pt = predict_pitch_bounce_from_track(
                 det_list, frame_index, last_bounce_frame, fps, h_matrix,
                 persistent_video_bounces, height, width=width,
                 lock_frame=delivery_lock_frame, lock_pt=delivery_lock_pt, cam_quad=cam_quad)
@@ -1189,7 +1519,7 @@ def track_delivery_clip(cap, clip, model, fps, width, height, h_matrix, h_inv, d
                 initial_label = 'RUNS' if post_hit_max_speed >= 8.0 else 'DOTS'
                 if bounced_this_delivery and job_bounces:
                     _relable_last_bounce(job_bounces, session_bounces, persistent_video_bounces, initial_label, hit=True)
-                else:
+                elif not BOUNCE_DOT_ONLY:
                     hp = contact or (hist[-3] if len(hist) >= 3 else hist[-1])
                     speed = _compute_delivery_speed(raw_list, fps, height, h_matrix)
                     result = _add_delivery_marker(
@@ -1218,7 +1548,7 @@ def track_delivery_clip(cap, clip, model, fps, width, height, h_matrix, h_inv, d
                 event_status = "MISS"
                 _relable_last_bounce(job_bounces, session_bounces, persistent_video_bounces, 'WICKETS', hit=False)
 
-    if not bounced_this_delivery and not hit_occurred and len(det_history) >= BOUNCE_MIN_TRACK_FRAMES:
+    if not BOUNCE_DOT_ONLY and not bounced_this_delivery and not hit_occurred and len(det_history) >= BOUNCE_MIN_TRACK_FRAMES:
         last_marker_frame, registered = _register_dot_from_track(
             list(det_history), height, h_matrix, min(frame_index, clip.end),
             job_bounces, session_bounces, persistent_video_bounces, fps,
@@ -1226,11 +1556,12 @@ def track_delivery_clip(cap, clip, model, fps, width, height, h_matrix, h_inv, d
         if registered:
             bounced_this_delivery = True
 
-    last_marker_frame = _close_delivery(
-        list(det_history), height, h_matrix, min(frame_index, clip.end),
-        hit_occurred, event_status, bounced_this_delivery,
-        job_bounces, session_bounces, persistent_video_bounces,
-        fps=fps, last_marker_frame=last_marker_frame, post_hit_max_speed=post_hit_max_speed)
+    if not BOUNCE_DOT_ONLY:
+        last_marker_frame = _close_delivery(
+            list(det_history), height, h_matrix, min(frame_index, clip.end),
+            hit_occurred, event_status, bounced_this_delivery,
+            job_bounces, session_bounces, persistent_video_bounces,
+            fps=fps, last_marker_frame=last_marker_frame, post_hit_max_speed=post_hit_max_speed)
 
     clip_bounces = [
         b for b in job_bounces
@@ -1405,6 +1736,7 @@ def _finalize_video_output(output_path, job_bounces, frame_index, hit_occurred, 
         'event_status': event_status,
         'output_path': output_path,
         'bounce_events': bounce_events,
+        'delivery_count': len(bounce_events),
         'ball_stats': ball_stats,
         'analytics': analytics,
         'speed_stats': speed_stats,
@@ -1433,7 +1765,7 @@ def _finalize_video_output(output_path, job_bounces, frame_index, hit_occurred, 
 def _process_video_clip_mode(cap, output_path, job_id, model, use_half, yolo_device,
                              fps, width, height, total_frames, h_matrix, h_inv,
                              zone_color, zone_mask, pitch_annotations, pitch_alpha,
-                             video_name=''):
+                             video_name='', flight_corridor=None):
     """3-pass clip-by-clip pipeline."""
     global session_bounces
     dt = 1.0 / fps
@@ -1471,6 +1803,7 @@ def _process_video_clip_mode(cap, output_path, job_id, model, use_half, yolo_dev
             cap, clip, model, fps, width, height, h_matrix, h_inv, dt,
             use_half, yolo_device, job_bounces, session_bounces,
             persistent_video_bounces, last_marker_frame, clip_index=i + 1,
+            flight_corridor=flight_corridor,
         )
         clip_results.append(clip_result)
         pct = 30 + (i + 1) / len(clips) * 40
@@ -1491,11 +1824,42 @@ def _process_video_clip_mode(cap, output_path, job_id, model, use_half, yolo_dev
         job_id=job_id, video_name=video_name,
     )
 
+def _player_scene_from_dict(data: dict | None, width: int, height: int) -> PlayerScene:
+    from core.player_detector import DetectedPlayer
+
+    landscape = is_landscape_frame(width, height)
+    if not data:
+        return PlayerScene(landscape=landscape)
+
+    def _load(role: str) -> DetectedPlayer | None:
+        raw = data.get(role)
+        if not raw:
+            return None
+        bb = raw.get("bbox") or [0, 0, 0, 0]
+        ctr = raw.get("center") or [0, 0]
+        return DetectedPlayer(
+            role=role,
+            bbox=(int(bb[0]), int(bb[1]), int(bb[2]), int(bb[3])),
+            center=(float(ctr[0]), float(ctr[1])),
+            confidence=float(raw.get("confidence", 0.5)),
+        )
+
+    scene = PlayerScene(
+        landscape=bool(data.get("landscape", landscape)),
+        striker=_load("striker"),
+        bowler=_load("bowler"),
+        non_striker=_load("non_striker"),
+    )
+    scene.players = [p for p in (scene.striker, scene.bowler, scene.non_striker) if p]
+    return scene
+
+
 # ---------- Core processing ----------
 def process_video(input_path, output_path, job_id=None, options=None):
     global session_bounces
     options = options or {}
     manual_quad = options.get('manual_quad')
+    video_profile = _profile_as_video_profile(options.get('video_profile'))
 
     try:
         model, use_half, yolo_device = _get_yolo()
@@ -1513,15 +1877,17 @@ def process_video(input_path, output_path, job_id=None, options=None):
     dt     = 1.0/fps
     infer_scale = min(1.0, INFER_MAX_DIM / max(width, height, 1))
 
-    # Per-video homography — robust calibration (manual > stump+colour > fallback)
-    calib = calibrate_pitch_robust(
-        cap, width, height,
-        manual_quad=manual_quad,
-        max_samples=CALIB_SAMPLES,
-    )
-    cam_quad = calib.quad
-    _set_processing_context(calib.stump_scale)
-    print(f"[PitchCalib] source={calib.source} conf={calib.confidence:.2f} stump_scale={calib.stump_scale:.3f}")
+    if video_profile is not None:
+        calib = calibration_from_profile(video_profile)
+        _log(f"[PitchCalib] cached source={calib.source} conf={calib.confidence:.2f} "
+             f"stump_scale={calib.stump_scale:.3f} samples={video_profile.calib_samples}")
+    else:
+        calib = calibrate_pitch_robust(
+            cap, width, height,
+            manual_quad=manual_quad,
+            max_samples=CALIB_SAMPLES,
+        )
+        _log(f"[PitchCalib] source={calib.source} conf={calib.confidence:.2f} stump_scale={calib.stump_scale:.3f}")
     print(f"[Homography] quad validated — pitch map aligned (landscape={is_landscape_frame(width, height)})")
     from core.ball_kalman import kalman_config
     kcfg = kalman_config()
@@ -1531,18 +1897,83 @@ def process_video(input_path, output_path, job_id=None, options=None):
         print(f"[Video] landscape {width}x{height} — approach_y={effective_approach_y_min(width, height):.2f} ball_area={lo:.0f}-{hi:.0f}px²")
     if DETECT_PITCH_AREA_ONLY:
         print("[Detect] pitch-area-only — ball search on pitch strip + machine release corridor")
+
+    player_scene_data = (
+        video_profile.calibration.get("players") if video_profile else None
+    )
+    player_scene = _player_scene_from_dict(player_scene_data, width, height)
+    if not options.get("manual_quad"):
+        player_quad, player_zones = apply_player_pitch_calibration(
+            width, height, player_scene,
+        )
+        if player_quad is not None and player_zones is not None:
+            calib.quad = player_quad
+            calib.source = "players"
+            video_zones_from_players = player_zones
+            _log("[PitchCalib] batsman stance → bowler end (overlay hidden)")
+        else:
+            video_zones_from_players = None
+    else:
+        video_zones_from_players = None
+
     h_matrix, h_inv, cam_quad = build_homography(calib.quad, TEMPLATE_CORNERS)
     calib_meta_quad = cam_quad.tolist()
+
+    video_zones = video_zones_from_players
+    if video_zones is None and video_profile is not None and video_profile.calibration.get("zones"):
+        video_zones = video_profile.calibration["zones"]
+    if video_zones is None:
+        video_zones = derive_zones_from_quad(cam_quad, width, height)
+    apply_video_zones(video_zones)
+    print(f"[VideoCalib] zones from pitch quad — {zones_for_log(video_zones)}")
+
+    bat_xy = None
+    rel_xy = None
+    if player_scene.striker is not None:
+        x1, y1, x2, y2 = player_scene.striker.bbox
+        bat_xy = ((x1 + x2) * 0.5, float(y2))
+    if player_scene.bowler is not None:
+        x1, y1, x2, y2 = player_scene.bowler.bbox
+        rel_xy = ((x1 + x2) * 0.5, float(y2))
+    delivery_lane = DeliveryLane.calibrate(
+        width, height, quad=cam_quad, zones=video_zones, cap=cap,
+        batsman_xy=bat_xy, release_xy=rel_xy,
+    )
+    flight_corridor = delivery_lane.corridor
+    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+    player_exclude_boxes = [p.bbox for p in player_scene.players if p is not None]
+    print(
+        f"[DeliveryLane] release={tuple(int(v) for v in delivery_lane.release_center)} "
+        f"batsman={tuple(int(v) for v in delivery_lane.batsman_center)} "
+        f"landscape={delivery_lane.landscape}"
+    )
+    print(
+        f"[FlightCorridor] source={flight_corridor.source} landscape={flight_corridor.landscape} "
+        f"poly={flight_corridor.polygon.astype(int).tolist()}"
+    )
+    if DELIVERY_BALL_ONLY:
+        print("[Mode] auto-calibration + delivery-ball-only (bowler/machine → batsman, small ball)")
     clear_template_cache()
     zone_color, zone_mask = precompute_pitch_zone_layers(height, width, h_inv)
     pitch_annotations = build_pitch_annotation_layer(height, width, h_inv)
     pitch_alpha = 0.55
+    if video_profile is not None:
+        calibration_meta_video_profile = video_profile.to_dict()
+    else:
+        calibration_meta_video_profile = None
     calibration_meta = {
         'source': calib.source,
         'confidence': calib.confidence,
         'stump_scale': calib.stump_scale,
         'quad': cam_quad.tolist(),
+        'flight_corridor': flight_corridor.to_dict(),
+        'delivery_lane': delivery_lane.to_dict(),
+        'zones': video_zones,
+        'players': player_scene.to_dict(),
+        'fully_automatic': FULLY_AUTOMATIC,
     }
+    if calibration_meta_video_profile is not None:
+        calibration_meta['video_profile'] = calibration_meta_video_profile
 
     # --- Primary: frame-by-frame streaming (tracks ALL balls like original app) ---
     use_clip_pipeline = CLIP_BY_CLIP and CLIP_MODE == 'clip' and model is not None
@@ -1552,6 +1983,7 @@ def process_video(input_path, output_path, job_id=None, options=None):
             fps, width, height, total_frames, h_matrix, h_inv,
             zone_color, zone_mask, pitch_annotations, pitch_alpha,
             video_name=os.path.basename(input_path),
+            flight_corridor=flight_corridor,
         )
         cap.release()
         if clip_result is not None:
@@ -1561,23 +1993,45 @@ def process_video(input_path, output_path, job_id=None, options=None):
         if not cap.isOpened():
             raise RuntimeError(f"Cannot reopen: {input_path}")
 
-    print(f"[StreamMode] Frame-by-frame tracking — all deliveries (RUN + DOT)")
-    if SHOW_PREDICTIONS:
-        print("[BouncePredict] pre-bounce landing prediction enabled")
-    if TRACK_DELIVERY_IN_FLIGHT:
-        print("[Delivery] flight tracking ON — release→batsman (ground resting balls rejected)")
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    writer = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
-
     stab_cfg = stabilization_config()
-    if options.get('stabilize') is not None:
+    if video_profile is not None and options.get('stabilize') is None:
+        stab_cfg = dict(stab_cfg)
+        stab_cfg['mode'] = video_profile.stabilize
+    elif options.get('stabilize') is not None:
         stab_cfg = dict(stab_cfg)
         stab_cfg['mode'] = str(options.get('stabilize')).lower()
         if stab_cfg['mode'] in ('1', 'true', 'yes', 'on'):
             stab_cfg['mode'] = 'always'
         if stab_cfg['mode'] in ('0', 'false', 'no', 'off'):
             stab_cfg['mode'] = 'off'
+
+    print(f"[StreamMode] Frame-by-frame tracking — all deliveries (RUN + DOT)")
+    if DEEP_LEARNING_ENABLED:
+        DeepLearningPipeline.get().initialize()
+        print("[DL] Full deep-learning mode — YOLO + pose + temporal bounce + hit + length nets")
+    _wait_infer = _video_infer_settings(False, width, height, video_profile)
+    _infer_scale0 = _apply_min_infer_scale(min(1.0, _wait_infer['max_dim'] / max(width, height, 1)))
+    _det_conf = video_profile.detection_conf if video_profile else CONFIG['model']['confidence']
+    _wait_conf = video_profile.waiting_conf if video_profile else float(_PROC.get('waiting_conf', 0.04))
+    print(f"[Detect] conf={_det_conf} waiting={_wait_conf} "
+          f"trust={_PROC.get('ball_trust_conf', 0.08)} pitch_only={DETECT_PITCH_AREA_ONLY} "
+          f"stabilize={stab_cfg.get('mode', 'auto')}")
+    print(f"[Detect] 4K/UHD infer max_dim={_wait_infer['max_dim']} scale={_infer_scale0:.3f} imgsz={_wait_infer['imgsz']}")
+    if SHOW_PREDICTIONS:
+        print("[BouncePredict] pre-bounce landing prediction enabled")
+    if BOUNCE_DOT_ONLY:
+        print("[Pipeline] bowler→batsman lane | detect ball | first pitch bounce dot")
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    writer = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+
     stabilizer = VideoStabilizer(width, height, stab_cfg)
+    homography_recalib = HomographyRecalibrator(width, height, fps)
+    homography_recalib.set_baseline(cam_quad)
+    session_tracker = SessionTracker(
+        fps, h_matrix=h_matrix, cam_quad=cam_quad, height=height, width=width,
+        min_bounce_confidence=BOUNCE_DIRECTION_MIN_CONF,
+        bounce_confirm_frames=BOUNCE_FRAMES_AFTER_CONTACT,
+    )
     if stab_cfg['mode'] != 'off':
         print(f"[Stabilize] mode={stab_cfg['mode']} (shake auto-threshold={stab_cfg['shake_enable_px']}px)")
 
@@ -1585,10 +2039,25 @@ def process_video(input_path, output_path, job_id=None, options=None):
     history = SmoothHistory(maxlen=200, smooth_window=3)
     raw_history = deque(maxlen=200)
     det_history = deque(maxlen=200)
+    det_frame_history = deque(maxlen=200)
     pending_lock_pts = deque(maxlen=12)
+    pending_release_track = deque(maxlen=16)
     frames_since_det = 999
     last_velocity = 0.0
-    coast_limit = _coast_limit_frames(fps)
+    watch_cfg = _watch_tracking_settings(fps)
+    coast_limit = watch_cfg["coast_limit"]
+    delivery_lost_frames = watch_cfg["delivery_lost_frames"]
+    gap_finalize_frames = watch_cfg["gap_finalize_frames"]
+    post_bounce_frames = watch_cfg["post_bounce_frames"]
+    require_machine_lock = watch_cfg["require_machine_lock"]
+    if watch_cfg["enabled"]:
+        print(
+            f"[Watch] release→end | machine_lock={require_machine_lock} "
+            f"coast={coast_limit / fps:.2f}s lost={delivery_lost_frames / fps:.2f}s "
+            f"trail={'on' if SHOW_BALL_TRACK else 'off'}"
+        )
+    if BALL_ONLY_PIPELINE:
+        print("[Pipeline] best.pt detect → track → red bounce dot only (no trajectory)")
 
     event_status   = "WAITING"
     hit_occurred   = False
@@ -1609,37 +2078,68 @@ def process_video(input_path, output_path, job_id=None, options=None):
     bounce_hist_idx = None
     current_bounce_prediction = None
     last_bounce_prediction = None
+    direction_bounce_pred = None
     delivery_lock_frame = -1
     delivery_lock_pt = None
+    pitch_point_markers = []
+    current_delivery_track = []
+    delivery_marked = False
+    delivery_counter = 0
     panel_w = min(480, max(320, int(width * 0.42)))
     cached_live_panel = None
     cached_bounce_count = -1
     empty_panel = build_panel_image([], 'PITCH MAP', panel_w) if SHOW_CORNER_PITCH_MAP else None
     last_relable_label = None
     progress_step = max(50, total_frames // 20) if total_frames > 0 else 100
+    last_raw_yolo_pt = None
+    last_raw_yolo_conf = 0.0
+    gemini_umpire = get_gemini_umpire()
+    gemini_frame_ring: deque = deque(maxlen=int(_GEMINI_CFG.get('verify_frames', 3)) + 6)
+    gemini_hit_reviewed = False
 
     while True:
         ret, frame = cap.read()
         if not ret: break
         frame = stabilizer.process(frame)
+        recalib = homography_recalib.maybe_recalibrate(
+            frame_index, frame, shake_px=stabilizer.stats().get("last_shake_px", 0.0),
+        )
+        if recalib is not None:
+            h_matrix, h_inv, cam_quad = build_homography(recalib.quad, TEMPLATE_CORNERS)
+            video_zones = derive_zones_from_quad(cam_quad, width, height)
+            apply_video_zones(video_zones)
+            delivery_lane = DeliveryLane.calibrate(
+                width, height, quad=cam_quad, zones=video_zones,
+            )
+            flight_corridor = delivery_lane.corridor
+            zone_color, zone_mask = precompute_pitch_zone_layers(height, width, h_inv)
+            pitch_annotations = build_pitch_annotation_layer(height, width, h_inv)
+            homography_recalib.set_baseline(cam_quad)
+            calibration_meta['recalibrations'] = homography_recalib.recalibration_count
         frame_index += 1
+        if gemini_umpire.available:
+            gemini_frame_ring.append((frame_index, frame.copy()))
         gap_frames = frames_since_det + 1
         frames_since_det += 1
         best_coords = None
         best_score = -float('inf')
+        best_det_area = 0.0
+        best_det_bottom = None
         is_predicted = False
+        raw_boxes = 0
+        yolo_raw_best = None
+        yolo_raw_conf = 0.0
 
         detect_imgsz = min(1280, max(640, max(width, height)))
         run_detect = model is not None
         ball_active = kf.initialized or event_status != "WAITING"
-        gpu_infer = infer_settings(ball_active)
-        if not ball_active and is_landscape_frame(width, height):
-            gpu_infer = infer_settings(True)
+        gpu_infer = _video_infer_settings(ball_active, width, height, video_profile)
         detect_imgsz = gpu_infer['imgsz']
-        infer_scale_run = min(1.0, gpu_infer['max_dim'] / max(width, height, 1))
-        conf_thresh = CONFIG['model']['confidence']
+        infer_scale_run = _apply_min_infer_scale(
+            min(1.0, gpu_infer['max_dim'] / max(width, height, 1)))
+        conf_thresh = _det_conf
         if event_status == "WAITING" and not kf.initialized:
-            conf_thresh = float(_PROC.get('waiting_conf', 0.12))
+            conf_thresh = _wait_conf
         post_contact = bounced_this_delivery or hit_occurred
 
         skip_detect = False
@@ -1657,8 +2157,8 @@ def process_video(input_path, output_path, job_id=None, options=None):
                                          interpolation=cv2.INTER_LINEAR)
             inv = 1.0 / infer_scale_run
             results = _yolo_predict(model, infer_frame, conf=conf_thresh, imgsz=detect_imgsz, max_det=10,
-                                    half=use_half, device=yolo_device,
-                                    augment=False, stream=False)
+                                    device=yolo_device, augment=False, stream=False)
+            raw_boxes = len(results[0].boxes)
             for box in results[0].boxes:
                 if not is_ball_class(int(box.cls[0].item())): continue
                 x1, y1, x2, y2 = box.xyxy[0].tolist()
@@ -1667,12 +2167,12 @@ def process_video(input_path, output_path, job_id=None, options=None):
                 if not ball_bbox_size_ok(area, height, width):
                     continue
                 cx, cy = int((x1 + x2) / 2 * inv), int((y1 + y2) / 2 * inv)
-                aspect = bw / (bh + 1e-5)
-                round_ok = 0.75 < aspect < 1.35
-                if not round_ok and not in_machine_release_zone(cx, cy, width, height):
+                if _inside_exclude_box(cx, cy, player_exclude_boxes, pad=22.0) and area > 280:
                     continue
-                if not round_ok and not (0.55 < aspect < 1.65):
-                    continue
+                det_conf = float(box.conf[0].item())
+                if det_conf > yolo_raw_conf:
+                    yolo_raw_conf = det_conf
+                    yolo_raw_best = (cx, cy)
 
                 ix1, iy1 = max(0, int(x1 * inv)), max(0, int(y1 * inv))
                 ix2, iy2 = min(width, int(x2 * inv)), min(height, int(y2 * inv))
@@ -1684,6 +2184,9 @@ def process_video(input_path, output_path, job_id=None, options=None):
                         track_active=kf.initialized,
                         recent_points=recent_pts,
                         h_matrix=h_matrix,
+                        flight_corridor=flight_corridor,
+                        delivery_lane=delivery_lane,
+                        area=area,
                 ):
                     continue
                 
@@ -1713,12 +2216,15 @@ def process_video(input_path, output_path, job_id=None, options=None):
                     else:
                         score -= dist * 0.003
                 else:
-                    _, max_ball_area = ball_area_limits(height, width)
-                    size_bonus = 0.45 * (1.0 - min(1.0, area / max(max_ball_area, 1.0)))
-                    score = det_conf + size_bonus
-                    if area > max_ball_area * 0.40:
-                        score -= 0.55
-                    if not kf.initialized and pending_lock_pts:
+                    if trust_yolo_ball(det_conf):
+                        score = det_conf
+                    else:
+                        _, max_ball_area = ball_area_limits(height, width)
+                        size_bonus = 0.45 * (1.0 - min(1.0, area / max(max_ball_area, 1.0)))
+                        score = det_conf + size_bonus
+                        if area > max_ball_area * 0.40:
+                            score -= 0.55
+                    if not kf.initialized and pending_lock_pts and not trust_yolo_ball(det_conf):
                         lx, ly = pending_lock_pts[-1]
                         step_pending = math.hypot(cx - lx, cy - ly)
                         if step_pending < STATIC_REJECT_PX:
@@ -1731,27 +2237,67 @@ def process_video(input_path, output_path, job_id=None, options=None):
                                 align = trail_dx * cand_dx + trail_dy * cand_dy
                                 if align > 0:
                                     score += 0.08
+                    if not kf.initialized and width > 0 and in_machine_release_zone(cx, cy, width, height):
+                        score += 0.18
 
                 if score > best_score:
                     best_score = score
                     best_coords = (cx, cy)
+                    best_det_area = float(area)
+                    best_det_bottom = int(y2 * inv)
                     last_detection_conf = float(box.conf[0].item())
+                    last_raw_yolo_pt = (cx, cy)
+                    last_raw_yolo_conf = last_detection_conf
+
+        color_ball = find_colored_practice_ball(
+            frame, height, width, exclude_boxes=player_exclude_boxes,
+        )
+        if color_ball is not None:
+            ccx, ccy, cyb, carea = color_ball
+            yolo_is_body = best_coords is None or best_det_area > 500
+            color_is_ball = carea <= 450
+            if yolo_is_body and color_is_ball:
+                best_coords = (ccx, ccy)
+                best_det_area = float(carea)
+                best_det_bottom = int(cyb)
+                last_detection_conf = max(last_detection_conf, 0.35)
 
         # Reject weak detections when no active ball track
         if best_coords is not None and event_status == "WAITING" and not kf.initialized:
-            if last_detection_conf < MIN_NEW_DET_CONF:
+            if BALL_ONLY_PIPELINE:
+                min_conf = float(_PROC.get("waiting_conf", 0.06))
+            else:
+                min_conf = MIN_NEW_DET_CONF
+                if width > 0:
+                    bx, by = best_coords
+                    if in_machine_release_zone(bx, by, width, height):
+                        min_conf = float(_PROC.get("ball_trust_conf", 0.08))
+            if last_detection_conf < min_conf:
                 best_coords = None
+
+        if frame_index % 400 == 0 and not kf.initialized and run_detect and not skip_detect:
+            _log(f"[DetectDiag] f={frame_index} yolo_raw={raw_boxes} picked={best_coords is not None} "
+                 f"conf={conf_thresh:.2f} scale={infer_scale_run:.3f}")
 
         if best_coords is None and not kf.initialized and pending_lock_pts:
             if frames_since_det > int(max(8, fps * PENDING_CLEAR_SEC)):
                 pending_lock_pts.clear()
+                pending_release_track.clear()
 
         # ---- Update Kalman & History ----
         if best_coords is not None:
             cx, cy = best_coords
             from_waiting = event_status == "WAITING"
 
-            if gap_frames > int(fps * 0.45) and (kf.initialized or len(raw_history) > 0):
+            if gap_frames > gap_finalize_frames and (kf.initialized or len(raw_history) > 0):
+                if BOUNCE_MARK_MODE == 'first_lowest' and not delivery_marked:
+                    delivery_marked = _try_mark_first_pitch_point(
+                        current_delivery_track, delivery_lock_frame, height, delivery_counter,
+                        pitch_point_markers, delivery_marked,
+                        cam_quad=cam_quad, width=width,
+                        det_frame_history=list(det_frame_history),
+                        fps=fps, h_matrix=h_matrix, delivery_lane=delivery_lane,
+                    )
                 last_marker_frame = _finalize_delivery(
                     list(raw_history), height, h_matrix, frame_index,
                     hit_occurred, event_status, bounced_this_delivery,
@@ -1759,7 +2305,8 @@ def process_video(input_path, output_path, job_id=None, options=None):
                     fps=fps, last_marker_frame=last_marker_frame,
                     last_detection_conf=last_detection_conf,
                     post_hit_max_speed=post_hit_max_speed,
-                    hist_pts=list(raw_history), det_pts=list(det_history), width=width)
+                    hist_pts=list(raw_history), det_pts=list(det_history), width=width,
+                    lock_frame=delivery_lock_frame, lock_pt=delivery_lock_pt, cam_quad=cam_quad)
                 kf, st = _reset_delivery_state(kf, dt, history, raw_history, det_history)
                 last_marker_frame = -9999
                 hit_occurred = st['hit_occurred']
@@ -1773,13 +2320,57 @@ def process_video(input_path, output_path, job_id=None, options=None):
                 delivery_pose_frames = st['delivery_pose_frames']
                 event_status = st['event_status']
                 pending_lock_pts.clear()
+                pending_release_track.clear()
                 last_bounce_prediction = None
+                direction_bounce_pred = None
+                det_frame_history.clear()
                 delivery_lock_frame = -1
                 delivery_lock_pt = None
+                current_delivery_track = []
+                delivery_marked = False
 
             if not kf.initialized:
-                pending_lock_pts.append((cx, cy))
-                lock_ready = pending_delivery_confirmed(list(pending_lock_pts), height, width=width)
+                release_frame = None
+                if BALL_ONLY_PIPELINE and best_coords is not None:
+                    pending_lock_pts.append((cx, cy))
+                    pending_release_track.append(
+                        (frame_index, float(cx), float(cy), float(best_det_area)),
+                    )
+                    area_ok = ball_lock_area_ok(best_det_area, cx, cy, height, width)
+                    lock_ready = False
+                    if area_ok and trust_yolo_ball(last_detection_conf):
+                        if last_detection_conf >= 0.28:
+                            lock_ready = True
+                            release_frame = frame_index
+                        elif len(pending_lock_pts) >= 2:
+                            lock_ready = pending_delivery_confirmed(
+                                list(pending_lock_pts), height, width=width,
+                                det_conf=last_detection_conf,
+                            )
+                            if lock_ready:
+                                release_frame = int(pending_release_track[-1][0])
+                        if not lock_ready and last_detection_conf >= RELEASE_LOCK_CONF:
+                            release_frame = ball_release_confirmed(
+                                list(pending_release_track), height, width=width, fps=fps,
+                            )
+                            lock_ready = release_frame is not None
+                else:
+                    if require_machine_lock and is_landscape_frame(width, height):
+                        in_release = in_machine_release_zone(cx, cy, width, height)
+                        trail_release = any(
+                            in_machine_release_zone(int(p[0]), int(p[1]), width, height)
+                            for p in pending_lock_pts
+                        )
+                        if not in_release and not trail_release:
+                            best_coords = None
+                    if best_coords is not None:
+                        pending_lock_pts.append((cx, cy))
+                    lock_ready = pending_delivery_confirmed(
+                        list(pending_lock_pts), height, width=width, det_conf=last_detection_conf)
+                    if (BALL_ONLY_PIPELINE and trust_yolo_ball(last_detection_conf)
+                            and width > 0 and in_machine_release_zone(cx, cy, width, height)
+                            and ball_lock_area_ok(best_det_area, cx, cy, height, width)):
+                        lock_ready = True
                 if not can_start_new_delivery(
                         frame_index, last_marker_frame, gap_frames, fps,
                         last_detection_conf, from_waiting=True):
@@ -1787,14 +2378,55 @@ def process_video(input_path, output_path, job_id=None, options=None):
                 elif not lock_ready:
                     best_coords = None
                     frames_since_det = 0
-                elif best_coords is not None:
-                    kf.init(cx, cy)
+                elif not BALL_ONLY_PIPELINE and frame_index <= 5 and not in_machine_release_zone(cx, cy, width, height):
+                    best_coords = None
+                elif best_coords is not None and not kf.initialized:
+                    lo_area, hi_area = ball_area_limits(height, width)
+                    if best_det_area > 0 and best_det_area < lo_area:
+                        best_coords = None
+                    elif best_det_area > 0 and not ball_lock_area_ok(
+                            best_det_area, cx, cy, height, width):
+                        best_coords = None
+                    elif not BALL_ONLY_PIPELINE and is_landscape_frame(width, height):
+                        in_zone_now = in_machine_release_zone(cx, cy, width, height)
+                        in_zone_trail = any(
+                            in_machine_release_zone(int(p[0]), int(p[1]), width, height)
+                            for p in pending_lock_pts
+                        )
+                        if require_machine_lock:
+                            if not in_zone_now and not in_zone_trail:
+                                best_coords = None
+                        else:
+                            on_bowling_side = cx >= int(width * 0.38)
+                            if not in_zone_now and not in_zone_trail:
+                                if not (on_bowling_side and last_detection_conf >= 0.12):
+                                    best_coords = None
+                            elif last_detection_conf < 0.12 and not in_zone_now and not in_zone_trail:
+                                best_coords = None
+                if best_coords is not None and not kf.initialized:
+                    lock_cx, lock_cy = cx, cy
+                    lock_frame = frame_index
+                    if release_frame is not None:
+                        lock_frame = release_frame
+                        for f, x, y, _ in pending_release_track:
+                            if f == release_frame:
+                                lock_cx, lock_cy = int(x), int(y)
+                                break
+                    kf.init(lock_cx, lock_cy)
                     event_status = "BOWLED"
-                    delivery_lock_frame = frame_index
-                    delivery_lock_pt = (cx, cy)
+                    delivery_counter += 1
+                    delivery_marked = False
+                    current_delivery_track = [(lock_frame, float(lock_cx), float(lock_cy), best_det_area)]
+                    delivery_lock_frame = lock_frame
+                    delivery_lock_pt = (lock_cx, lock_cy)
                     pending_lock_pts.clear()
+                    pending_release_track.clear()
+                    gemini_hit_reviewed = False
                     last_bounce_prediction = None
-                    _log(f"[Frame {frame_index}] New delivery (gap={gap_frames}f, conf={last_detection_conf:.2f}, moving)")
+                    _log(
+                        f"[Release] frame {lock_frame} ball in flight "
+                        f"(detected f={frame_index}, conf={last_detection_conf:.2f}, area={best_det_area:.0f})"
+                    )
             elif best_coords is not None:
                 kf.predict()
                 if not kf.correct(cx, cy):
@@ -1810,6 +2442,14 @@ def process_video(input_path, output_path, job_id=None, options=None):
                     speed_est = max(step, math.hypot(vx, vy))
                     jump_limit = max(600, width * 0.65, speed_est * 8.0)
                     if step > jump_limit and gap_frames <= int(fps * 0.30):
+                        if BOUNCE_MARK_MODE == 'first_lowest' and not delivery_marked:
+                            delivery_marked = _try_mark_first_pitch_point(
+                                current_delivery_track, delivery_lock_frame, height, delivery_counter,
+                                pitch_point_markers, delivery_marked,
+                                cam_quad=cam_quad, width=width,
+                                det_frame_history=list(det_frame_history),
+                                fps=fps, h_matrix=h_matrix, delivery_lane=delivery_lane,
+                            )
                         last_marker_frame = _finalize_delivery(
                             list(raw_history), height, h_matrix, frame_index,
                             hit_occurred, event_status, bounced_this_delivery,
@@ -1817,12 +2457,19 @@ def process_video(input_path, output_path, job_id=None, options=None):
                             fps=fps, last_marker_frame=last_marker_frame,
                             last_detection_conf=last_detection_conf,
                             post_hit_max_speed=post_hit_max_speed,
-                            hist_pts=list(raw_history), det_pts=list(det_history), width=width)
+                            hist_pts=list(raw_history), det_pts=list(det_history), width=width,
+                    lock_frame=delivery_lock_frame, lock_pt=delivery_lock_pt, cam_quad=cam_quad)
                         raw_history.clear()
                         det_history.clear()
+                        det_frame_history.clear()
                         pending_lock_pts.clear()
+                        pending_release_track.clear()
+                        direction_bounce_pred = None
                         kf = create_ball_kalman(fps)
                         kf.init(cx, cy)
+                        delivery_counter += 1
+                        delivery_marked = False
+                        current_delivery_track = [(frame_index, float(cx), float(cy), best_det_area)]
                         delivery_lock_frame = frame_index
                         delivery_lock_pt = (cx, cy)
                         hit_occurred = False
@@ -1838,7 +2485,10 @@ def process_video(input_path, output_path, job_id=None, options=None):
                     kf = create_ball_kalman(fps)
                     raw_history.clear()
                     det_history.clear()
+                    det_frame_history.clear()
                     pending_lock_pts.clear()
+                    pending_release_track.clear()
+                    direction_bounce_pred = None
                     event_status = "WAITING"
                     best_coords = None
 
@@ -1846,6 +2496,7 @@ def process_video(input_path, output_path, job_id=None, options=None):
                     history.add((cx, cy))
                     raw_history.append((cx, cy))
                     det_history.append((cx, cy))
+                    det_frame_history.append((frame_index, cx, best_det_bottom if best_det_bottom is not None else cy, best_det_area))
                     frames_since_det = 0
                     if event_status == "WAITING":
                         event_status = "BOWLED"
@@ -1864,6 +2515,37 @@ def process_video(input_path, output_path, job_id=None, options=None):
         else:
             if kf.initialized:
                 kf.predict()
+
+        session_det = None
+        if yolo_raw_best is not None and yolo_raw_conf >= 0.06:
+            session_det = (float(yolo_raw_best[0]), float(yolo_raw_best[1]))
+        elif best_coords is not None:
+            session_det = (float(best_coords[0]), float(best_coords[1]))
+        session_tracker.step(frame_index, session_det)
+
+        if (delivery_lock_frame >= 0 and kf.initialized
+                and frame_index >= delivery_lock_frame
+                and event_status in ("BOWLED", "POST_HIT", "MISS")):
+            if best_coords is not None:
+                tx, ty = float(best_coords[0]), float(best_coords[1])
+            else:
+                tx, ty = kf.get_position()
+            if not current_delivery_track or current_delivery_track[-1][0] != frame_index:
+                det_area = float(best_det_area) if best_coords is not None and not is_predicted else -1.0
+                current_delivery_track.append((frame_index, tx, ty, det_area))
+
+        if (BOUNCE_MARK_MODE == 'first_lowest' and not delivery_marked
+                and delivery_lock_frame >= 0):
+            delivery_marked = _try_mark_first_pitch_point(
+                current_delivery_track, delivery_lock_frame, height, delivery_counter,
+                pitch_point_markers, delivery_marked,
+                cam_quad=cam_quad, width=width,
+                det_frame_history=list(det_frame_history),
+                fps=fps, h_matrix=h_matrix, delivery_lane=delivery_lane,
+            )
+            if delivery_marked:
+                bounced_this_delivery = True
+                frames_since_bounce = 0
 
         raw_list = interpolate_track_gaps(list(raw_history), fps)
         det_list = list(det_history)
@@ -1884,19 +2566,44 @@ def process_video(input_path, output_path, job_id=None, options=None):
         if bounced_this_delivery:
             frames_since_bounce += 1
 
+        if event_status == "BOWLED" and not bounced_this_delivery and not hit_occurred and len(det_frame_history) >= 10:
+            if BOUNCE_MARK_MODE != 'first_lowest':
+                fusion = predict_bounce_fusion(
+                    [(f, x, y) for f, x, y, *_ in det_frame_history],
+                    h_matrix=h_matrix,
+                    cam_quad=cam_quad,
+                    height=height,
+                    fps=fps,
+                    min_confidence=BOUNCE_DIRECTION_MIN_CONF,
+                )
+                if fusion is not None:
+                    direction_bounce_pred = fusion
+
         current_bounce_prediction = None
-        if event_status == "BOWLED" and not bounced_this_delivery and not hit_occurred:
+        if BOUNCE_MARK_MODE != 'first_lowest' and not BOUNCE_DOT_ONLY and event_status == "BOWLED" and not bounced_this_delivery and not hit_occurred:
             current_bounce_prediction = _compute_bounce_prediction(
                 det_list, h_matrix, h_inv, fps, height, width=width)
             if current_bounce_prediction is not None:
                 last_bounce_prediction = current_bounce_prediction
 
-        # ---- Bounce: one marker per delivery on pitch ----
-        if event_status == "BOWLED" and not bounced_this_delivery and not hit_occurred:
-            bounce_pt = _try_detect_bounce(
-                det_list, frame_index, last_bounce_frame, fps, h_matrix,
-                persistent_video_bounces, height, width=width,
-                lock_frame=delivery_lock_frame, lock_pt=delivery_lock_pt, cam_quad=cam_quad)
+        # ---- Phase 2: pitch bounce dot ----
+        if (BOUNCE_MARK_MODE != 'first_lowest'
+                and event_status == "BOWLED" and not bounced_this_delivery and not hit_occurred and kf.initialized):
+            bounce_pt = None
+            if (direction_bounce_pred is not None
+                    and direction_bounce_pred.confidence >= BOUNCE_DIRECTION_MIN_CONF
+                    and frame_index - direction_bounce_pred.bounce_frame >= BOUNCE_FRAMES_AFTER_CONTACT):
+                bx, by = int(direction_bounce_pred.image_x), int(direction_bounce_pred.image_y)
+                if cam_quad is not None:
+                    snapped = snap_to_pitch_ground(bx, by, cam_quad, height)
+                    if snapped is not None:
+                        bx, by = snapped
+                bounce_pt = (bx, by)
+            if bounce_pt is None:
+                bounce_pt = predict_pitch_bounce_from_track(
+                    det_list, frame_index, last_bounce_frame, fps, h_matrix,
+                    persistent_video_bounces, height, width=width,
+                    lock_frame=delivery_lock_frame, lock_pt=delivery_lock_pt, cam_quad=cam_quad)
             if bounce_pt is not None:
                 bx, by = bounce_pt
                 bounce_detected = True
@@ -1924,7 +2631,8 @@ def process_video(input_path, output_path, job_id=None, options=None):
                     length_zone = result[0]
                     last_marker_frame = result[1]
                     last_bounce_frame = frame_index
-                    print(f"[Frame {frame_index}] BOUNCE #{len(persistent_video_bounces)} @ {video_bounce_coords} | {ball_label} | {length_zone} | {speed:.0f} km/h")
+                    print(f"[Frame {frame_index}] BOUNCE #{len(persistent_video_bounces)} @ {video_bounce_coords} | {ball_label} | {length_zone} | {speed:.0f} km/h"
+                          f"{' | dir' if direction_bounce_pred else ''}")
                 else:
                     bounced_this_delivery = False
         elif bounced_this_delivery and not hit_occurred:
@@ -1935,10 +2643,33 @@ def process_video(input_path, output_path, job_id=None, options=None):
 
         # ---- Hit & Miss: only after ball reaches batsman approach zone ----
         ball_near_batsman = bool(hist) and in_batsman_approach_zone(hist[-1][1], height, width=width)
-        if ball_near_batsman and event_status in ("BOWLED", "MISS") and not hit_occurred:
+        min_hit_frames = max(18, int(fps * 0.40))
+        lock_travel_ok = True
+        if delivery_lock_pt is not None and hist:
+            min_travel = max(60.0, width * 0.10)
+            lock_travel_ok = math.hypot(
+                hist[-1][0] - delivery_lock_pt[0], hist[-1][1] - delivery_lock_pt[1]) >= min_travel
+        if (ball_near_batsman and lock_travel_ok and event_status in ("BOWLED", "MISS") and not hit_occurred
+                and len(raw_history) >= min_hit_frames
+                and frame_index - delivery_lock_frame >= min_hit_frames):
             is_hit, hit_conf, contact = score_hit_enhanced(
                 raw_list, hist, height, fps, bounced_this_delivery, frames_since_bounce,
                 bounce_hist_idx=bounce_hist_idx, pose_frames=pose_samples)
+            if not gemini_hit_reviewed:
+                ball_xy = (int(hist[-1][0]), int(hist[-1][1])) if hist else None
+                gem = _gemini_review_hit_miss(
+                    gemini_umpire, gemini_frame_ring, frame_index,
+                    heuristic_hit=is_hit, heuristic_miss=False, heuristic_conf=hit_conf,
+                    ball_xy=ball_xy, height=height, width=width,
+                )
+                if gem is not None:
+                    g_hit, g_miss, g_conf, g_reason = gem
+                    gemini_hit_reviewed = True
+                    _log(f"[Frame {frame_index}] Gemini umpire hit={g_hit} miss={g_miss} conf={g_conf:.2f} — {g_reason}")
+                    if g_hit:
+                        is_hit, hit_conf = True, g_conf
+                    elif g_miss:
+                        is_hit, hit_conf = False, g_conf
             if is_hit:
                 hit_occurred = True
                 event_status = "POST_HIT"
@@ -1947,7 +2678,7 @@ def process_video(input_path, output_path, job_id=None, options=None):
                 initial_label = 'RUNS' if post_hit_max_speed >= 8.0 else 'DOTS'
                 if bounced_this_delivery and job_bounces:
                     _relable_last_bounce(job_bounces, session_bounces, persistent_video_bounces, initial_label, hit=True)
-                else:
+                elif not BOUNCE_DOT_ONLY:
                     hp = contact or (hist[-3] if len(hist) >= 3 else hist[-1])
                     speed = _compute_delivery_speed(raw_list, fps, height, h_matrix)
                     result = _add_delivery_marker(
@@ -1976,13 +2707,58 @@ def process_video(input_path, output_path, job_id=None, options=None):
             miss_ready = frames_since_bounce >= max(6, int(fps * 0.10))
             if miss_ready and not hit_occurred and classify_miss(
                     hist, height, hit_occurred, bounced_this_delivery, batsman_y_max=y_max_val):
-                event_status = "MISS"
-                _relable_last_bounce(job_bounces, session_bounces, persistent_video_bounces, 'WICKETS', hit=False)
-                print(f"[Frame {frame_index}] MISS — batsman left the ball")
+                is_miss = True
+                if not gemini_hit_reviewed:
+                    ball_xy = (int(hist[-1][0]), int(hist[-1][1])) if hist else None
+                    gem = _gemini_review_hit_miss(
+                        gemini_umpire, gemini_frame_ring, frame_index,
+                        heuristic_hit=False, heuristic_miss=True, heuristic_conf=0.5,
+                        ball_xy=ball_xy, height=height, width=width,
+                    )
+                    if gem is not None:
+                        g_hit, g_miss, g_conf, g_reason = gem
+                        gemini_hit_reviewed = True
+                        _log(f"[Frame {frame_index}] Gemini umpire hit={g_hit} miss={g_miss} conf={g_conf:.2f} — {g_reason}")
+                        is_miss = g_miss and not g_hit
+                if is_miss:
+                    event_status = "MISS"
+                    _relable_last_bounce(job_bounces, session_bounces, persistent_video_bounces, 'WICKETS', hit=False)
+                    print(f"[Frame {frame_index}] MISS — batsman left the ball")
+
+        if (watch_cfg["enabled"] and delivery_marked and bounced_this_delivery
+                and frames_since_bounce > post_bounce_frames
+                and event_status == "BOWLED"):
+            last_marker_frame = _finalize_delivery(
+                list(raw_history), height, h_matrix, frame_index,
+                hit_occurred, event_status, bounced_this_delivery,
+                job_bounces, session_bounces, persistent_video_bounces,
+                fps=fps, last_marker_frame=last_marker_frame,
+                last_detection_conf=last_detection_conf,
+                post_hit_max_speed=post_hit_max_speed,
+                hist_pts=hist, y_max_val=y_max_val, det_pts=list(det_history), width=width,
+                lock_frame=delivery_lock_frame, lock_pt=delivery_lock_pt, cam_quad=cam_quad)
+            kf, st = _reset_delivery_state(kf, dt, history, raw_history, det_history)
+            last_marker_frame = -9999
+            hit_occurred = st['hit_occurred']
+            event_status = st['event_status']
+            bounced_this_delivery = st['bounced_this_delivery']
+            current_delivery_track = []
+            delivery_marked = False
+            delivery_lock_frame = -1
+            delivery_lock_pt = None
+            gemini_hit_reviewed = False
 
         # ---- Reset tracking between deliveries (always, including POST_HIT) ----
-        if frames_since_det > int(fps * 0.75):
+        if frames_since_det > delivery_lost_frames:
             if event_status != "WAITING" or len(raw_history) > 0:
+                if BOUNCE_MARK_MODE == 'first_lowest' and not delivery_marked:
+                    delivery_marked = _try_mark_first_pitch_point(
+                        current_delivery_track, delivery_lock_frame, height, delivery_counter,
+                        pitch_point_markers, delivery_marked,
+                        cam_quad=cam_quad, width=width,
+                        det_frame_history=list(det_frame_history),
+                        fps=fps, h_matrix=h_matrix, delivery_lane=delivery_lane,
+                    )
                 last_marker_frame = _finalize_delivery(
                     list(raw_history), height, h_matrix, frame_index,
                     hit_occurred, event_status, bounced_this_delivery,
@@ -1990,7 +2766,8 @@ def process_video(input_path, output_path, job_id=None, options=None):
                     fps=fps, last_marker_frame=last_marker_frame,
                     last_detection_conf=last_detection_conf,
                     post_hit_max_speed=post_hit_max_speed,
-                    hist_pts=hist, y_max_val=y_max_val, det_pts=list(det_history), width=width)
+                    hist_pts=hist, y_max_val=y_max_val, det_pts=list(det_history), width=width,
+                    lock_frame=delivery_lock_frame, lock_pt=delivery_lock_pt, cam_quad=cam_quad)
                 kf, st = _reset_delivery_state(kf, dt, history, raw_history, det_history)
                 last_marker_frame = -9999
                 hit_occurred = st['hit_occurred']
@@ -2002,10 +2779,60 @@ def process_video(input_path, output_path, job_id=None, options=None):
                 bounce_hist_idx = st['bounce_hist_idx']
                 post_hit_max_speed = st['post_hit_max_speed']
                 pre_hit_speed = st['pre_hit_speed']
+                current_delivery_track = []
+                delivery_marked = False
+                gemini_hit_reviewed = False
+
+        if event_status == "POST_HIT" and frame_index > delivery_lock_frame + int(fps * 3.0):
+            if BOUNCE_MARK_MODE == 'first_lowest' and not delivery_marked:
+                delivery_marked = _try_mark_first_pitch_point(
+                    current_delivery_track, delivery_lock_frame, height, delivery_counter,
+                    pitch_point_markers, delivery_marked,
+                    cam_quad=cam_quad, width=width,
+                    det_frame_history=list(det_frame_history),
+                    fps=fps, h_matrix=h_matrix, delivery_lane=delivery_lane,
+                )
+            last_marker_frame = _finalize_delivery(
+                list(raw_history), height, h_matrix, frame_index,
+                hit_occurred, event_status, bounced_this_delivery,
+                job_bounces, session_bounces, persistent_video_bounces,
+                fps=fps, last_marker_frame=last_marker_frame,
+                last_detection_conf=last_detection_conf,
+                post_hit_max_speed=post_hit_max_speed,
+                hist_pts=hist, y_max_val=y_max_val, det_pts=list(det_history), width=width,
+                lock_frame=delivery_lock_frame, lock_pt=delivery_lock_pt, cam_quad=cam_quad)
+            kf, st = _reset_delivery_state(kf, dt, history, raw_history, det_history)
+            last_marker_frame = -9999
+            hit_occurred = st['hit_occurred']
+            event_status = st['event_status']
+            bounce_detected = st['bounce_detected']
+            bounce_frame = st['bounce_frame']
+            bounced_this_delivery = st['bounced_this_delivery']
+            frames_since_bounce = st['frames_since_bounce']
+            bounce_hist_idx = st['bounce_hist_idx']
+            post_hit_max_speed = st['post_hit_max_speed']
+            pre_hit_speed = st['pre_hit_speed']
+            det_frame_history.clear()
+            direction_bounce_pred = None
+            delivery_lock_frame = -1
+            delivery_lock_pt = None
+            current_delivery_track = []
+            delivery_marked = False
+            gemini_hit_reviewed = False
+            pending_lock_pts.clear()
+            pending_release_track.clear()
 
         if event_status == "POST_HIT" and best_coords:
             lx, ly = best_coords
             if (lx < -20 or lx > width+20 or ly < -20 or ly > height+20) and frames_since_det > int(fps * 0.8):
+                if BOUNCE_MARK_MODE == 'first_lowest' and not delivery_marked:
+                    delivery_marked = _try_mark_first_pitch_point(
+                        current_delivery_track, delivery_lock_frame, height, delivery_counter,
+                        pitch_point_markers, delivery_marked,
+                        cam_quad=cam_quad, width=width,
+                        det_frame_history=list(det_frame_history),
+                        fps=fps, h_matrix=h_matrix, delivery_lane=delivery_lane,
+                    )
                 last_marker_frame = _finalize_delivery(
                     list(raw_history), height, h_matrix, frame_index,
                     hit_occurred, event_status, bounced_this_delivery,
@@ -2013,7 +2840,8 @@ def process_video(input_path, output_path, job_id=None, options=None):
                     fps=fps, last_marker_frame=last_marker_frame,
                     last_detection_conf=last_detection_conf,
                     post_hit_max_speed=post_hit_max_speed,
-                    hist_pts=hist, y_max_val=y_max_val, det_pts=list(det_history), width=width)
+                    hist_pts=hist, y_max_val=y_max_val, det_pts=list(det_history), width=width,
+                    lock_frame=delivery_lock_frame, lock_pt=delivery_lock_pt, cam_quad=cam_quad)
                 kf, st = _reset_delivery_state(kf, dt, history, raw_history, det_history)
                 last_marker_frame = -9999
                 hit_occurred = st['hit_occurred']
@@ -2025,57 +2853,97 @@ def process_video(input_path, output_path, job_id=None, options=None):
                 pre_hit_speed = st['pre_hit_speed']
                 post_hit_max_speed = st['post_hit_max_speed']
 
-        # ---- DRAWING: bounce dots + optional zone overlay (no corner pitch map) ----
-        if SHOW_CORNER_PITCH_MAP:
-            if len(job_bounces) != cached_bounce_count:
-                cached_live_panel = build_panel_image(
-                    [{'coords': b['coords'], 'type': b['type'],
-                      'length': b.get('length'), 'speed_kmh': b.get('speed_kmh', 0)} for b in job_bounces],
-                    'PITCH MAP', panel_w)
-                cached_bounce_count = len(job_bounces)
+        # ---- DRAWING: bounce dot ONLY (no trajectory, trail, or prediction overlays) ----
+        if SHOW_PITCH_BOUNCE_DOT_ONLY and BOUNCE_DOT_ONLY:
+            if BOUNCE_MARK_MODE == 'first_lowest':
+                _draw_bounce_dots(frame, pitch_point_markers, session_tracker, frame_index, cam_quad=cam_quad)
+        else:
+            if SHOW_CORNER_PITCH_MAP:
+                if len(job_bounces) != cached_bounce_count:
+                    cached_live_panel = build_panel_image(
+                        [{'coords': b['coords'], 'type': b['type'],
+                          'length': b.get('length'), 'speed_kmh': b.get('speed_kmh', 0)} for b in job_bounces],
+                        'PITCH MAP', panel_w)
+                    cached_bounce_count = len(job_bounces)
 
-        if SHOW_PITCH_ZONE_OVERLAY:
-            composite_pitch_zones(frame, zone_color, zone_mask, alpha=pitch_alpha)
-            nz = pitch_annotations.max(axis=2) > 0
-            frame[nz] = pitch_annotations[nz]
+            if SHOW_PITCH_ZONE_OVERLAY:
+                composite_pitch_zones(frame, zone_color, zone_mask, alpha=pitch_alpha)
+                nz = pitch_annotations.max(axis=2) > 0
+                frame[nz] = pitch_annotations[nz]
 
-        if SHOW_CORNER_PITCH_MAP:
-            if cached_live_panel is not None:
-                blit_panel(frame, cached_live_panel)
-            elif empty_panel is not None:
-                blit_panel(frame, empty_panel)
-        if persistent_video_bounces:
-            draw_light_bounce_dots(frame, persistent_video_bounces, use_video_coords=True, H_matrix=h_matrix)
-        if SHOW_PREDICTIONS and not bounced_this_delivery:
-            pred_draw = current_bounce_prediction or last_bounce_prediction
-            if pred_draw and pred_draw.get('video'):
-                vx, vy = pred_draw['video']
-                draw_predicted_bounce_marker(
-                    frame, int(vx), int(vy),
-                    length_hint=pred_draw.get('length', ''),
+            if SHOW_CORNER_PITCH_MAP:
+                if cached_live_panel is not None:
+                    blit_panel(frame, cached_live_panel)
+                elif empty_panel is not None:
+                    blit_panel(frame, empty_panel)
+            if BOUNCE_MARK_MODE == 'first_lowest' and pitch_point_markers:
+                draw_pitch_point_markers(frame, pitch_point_markers)
+            elif persistent_video_bounces:
+                draw_light_bounce_dots(frame, persistent_video_bounces, use_video_coords=True, H_matrix=h_matrix)
+            elif not SHOW_PITCH_BOUNCE_DOT_ONLY and (SHOW_BOUNCE_PREDICTION or SHOW_FULL_TRAJECTORY):
+                future_pts = []
+                kf_ref = session_tracker._analyzer.tracker.kalman
+                if SHOW_FUTURE_PATH and kf_ref and kf_ref.initialized:
+                    future_pts = predict_future_path(kf_ref, n_frames=12, start_frame=frame_index)
+                annotate_frame(
+                    frame,
+                    active=session_tracker.active,
+                    future_path=future_pts,
+                    locked_bounces=session_tracker.locked_bounces,
+                    delivery_count=session_tracker.delivery_count,
+                    show_trajectory=SHOW_FULL_TRAJECTORY,
+                    show_future=SHOW_FUTURE_PATH,
+                    show_hud=False,
                 )
-        if TRAIL_LENGTH > 0 and event_status in ("BOWLED", "POST_HIT") and hist:
-            trail = hist[-TRAIL_LENGTH:] if len(hist) > 1 else hist
-            live_pt = best_coords or (hist[-1] if hist else None)
-            draw_live_ball_track(frame, live_pt, trail_pts=trail, is_predicted=is_predicted)
-
+            if SHOW_PREDICTIONS and not bounced_this_delivery:
+                pred_draw = current_bounce_prediction or last_bounce_prediction
+                if pred_draw and pred_draw.get('video'):
+                    vx, vy = pred_draw['video']
+                    draw_predicted_bounce_marker(
+                        frame, int(vx), int(vy),
+                        length_hint=pred_draw.get('length', ''),
+                    )
+            if SHOW_BALL_TRACK and hist and event_status in ("BOWLED", "POST_HIT", "MISS"):
+                if watch_cfg["enabled"] and raw_history:
+                    trail = list(raw_history)
+                else:
+                    trail = hist[-TRAIL_LENGTH:] if TRAIL_LENGTH > 0 and len(hist) > 1 else None
+                live_pt = best_coords or hist[-1]
+                draw_live_ball_track(
+                    frame, live_pt, trail_pts=trail, is_predicted=is_predicted,
+                    max_trail=max(TRAIL_LENGTH, 240) if watch_cfg["enabled"] else TRAIL_LENGTH,
+                )
+            if SHOW_PLAYER_LABELS and player_scene.players:
+                draw_player_labels(frame, player_scene)
         stats = bounce_stats(persistent_video_bounces)
-        draw_batsman_stats_hud(
-            frame, event_status, stats, fps,
-            hit_occurred=hit_occurred, bounces=persistent_video_bounces,
-        )
+        if not (SHOW_PITCH_BOUNCE_DOT_ONLY and BOUNCE_DOT_ONLY):
+            draw_batsman_stats_hud(
+                frame, event_status, stats, fps,
+                hit_occurred=hit_occurred, bounces=persistent_video_bounces,
+            )
 
         writer.write(frame)
         if frame_index % progress_step == 0 or frame_index == total_frames:
             pct = (frame_index / total_frames * 100) if total_frames > 0 else 0
             _set_job_progress(job_id, pct, frame_index, total_frames)
-            _log(f"[Process] {frame_index}/{total_frames} ({pct:.0f}%) | deliveries={len(job_bounces)}")
+            _log(f"[Process] {frame_index}/{total_frames} ({pct:.0f}%) | marks={len(pitch_point_markers)}")
 
     cap.release()
+    session_deliveries = session_tracker.finalize()
+    _log(f"[Session] {session_tracker.delivery_count} deliveries tracked | "
+         f"{len(session_tracker.locked_bounces)} bounces confirmed")
     stab_info = stabilizer.stats()
     _log(f"[Stabilize] done enabled={stab_info['enabled']} applied={stab_info['applied']}/{stab_info['frames']} last_shake={stab_info['last_shake_px']}px")
     calibration_meta = dict(calibration_meta or {})
     calibration_meta['stabilization'] = stab_info
+    if BOUNCE_MARK_MODE == 'first_lowest' and not delivery_marked:
+        delivery_marked = _try_mark_first_pitch_point(
+            current_delivery_track, delivery_lock_frame, height, delivery_counter,
+            pitch_point_markers, delivery_marked,
+            cam_quad=cam_quad, width=width,
+            det_frame_history=list(det_frame_history),
+            fps=fps, h_matrix=h_matrix, delivery_lane=delivery_lane,
+        )
     last_marker_frame = _finalize_delivery(
         list(raw_history), height, h_matrix, frame_index,
         hit_occurred, event_status, bounced_this_delivery,
@@ -2083,7 +2951,14 @@ def process_video(input_path, output_path, job_id=None, options=None):
         fps=fps, last_marker_frame=last_marker_frame,
         last_detection_conf=last_detection_conf,
         post_hit_max_speed=post_hit_max_speed,
-        hist_pts=history.get_list(), det_pts=list(det_history), width=width)
+        hist_pts=history.get_list(), det_pts=list(det_history), width=width,
+        lock_frame=delivery_lock_frame, lock_pt=delivery_lock_pt, cam_quad=cam_quad)
+    _log(f"[PitchPoints] {len(pitch_point_markers)} first-lowest markers")
+    if BOUNCE_MARK_MODE == 'first_lowest':
+        _sync_pitch_marks_to_results(
+            pitch_point_markers, h_matrix, job_bounces, session_bounces,
+            persistent_video_bounces, fps=fps,
+        )
     _set_job_progress(job_id, 95, frame_index, total_frames)
 
     # ---- END SUMMARY: centred pitch map ----
@@ -2103,12 +2978,15 @@ def process_video(input_path, output_path, job_id=None, options=None):
             draw_zone_boundary_lines_on_video(summary, h_inv)
             draw_distance_markers_on_video(summary, h_inv)
             draw_zone_labels_on_video(summary, h_inv, map_panel_bounces)
-            draw_light_bounce_dots(summary, persistent_video_bounces, use_video_coords=True, H_matrix=h_matrix)
+            if BOUNCE_MARK_MODE == 'first_lowest' and pitch_point_markers:
+                draw_pitch_point_markers(summary, pitch_point_markers)
+            else:
+                draw_light_bounce_dots(summary, persistent_video_bounces, use_video_coords=True, H_matrix=h_matrix)
             draw_ball_stats_panels(summary, bounce_stats(persistent_video_bounces))
             paste_hawkeye_panel_centered(summary, map_panel_bounces, title='PITCH MAP', panel_img=end_panel)
             writer.write(summary)
             summary_count += 1
-    _log(f"[PitchMap] {summary_count} summary frames, {len(job_bounces)} bounces, version={API_VERSION}")
+    _log(f"[PitchMap] {summary_count} summary frames, {len(job_bounces)} bounces, {len(pitch_point_markers)} marks, version={API_VERSION}")
     writer.release()
 
     return _finalize_video_output(
@@ -2155,8 +3033,33 @@ def predict():
         except Exception as exc:
             print(f"[PitchCalib] Invalid manual quad: {exc}")
 
+    if AUTO_VIDEO_SETUP:
+        try:
+            if FULLY_AUTOMATIC and not options.get('manual_quad'):
+                from core.gpu_runtime import init_gpu_runtime
+                dev, half, _gn = init_gpu_runtime()
+                profile, _players, _auto_meta = run_automatic_setup(
+                    input_path, device=dev, half=half,
+                )
+            else:
+                profile = analyze_and_calibrate_video(
+                    input_path, manual_quad=options.get('manual_quad'))
+            profile_path = save_video_profile(input_path, profile)
+            log_video_profile(profile)
+            options['video_profile'] = profile.to_dict()
+            if options.get('stabilize') is None:
+                options['stabilize'] = profile.stabilize
+            print(f"[AutoSetup] profile saved → {os.path.basename(profile_path)}", flush=True)
+        except Exception as exc:
+            import traceback
+            traceback.print_exc()
+            print(f"[AutoSetup] skipped: {exc}", flush=True)
+
     with jobs_lock:
-        jobs[job_id] = {'status': 'queued', 'result': None, 'error': None, 'queued_at': time.time()}
+        jobs[job_id] = {
+            'status': 'queued', 'result': None, 'error': None, 'queued_at': time.time(),
+            'video_profile': options.get('video_profile'),
+        }
     job_queue.put((job_id, input_path, output_path, options))
     _drain_queue_except(job_id)
     pos = 1 if _current_job_id is None else job_queue.qsize()
@@ -2172,13 +3075,22 @@ def status(job_id):
     if job['status']=='cancelled':
         return jsonify({'status': 'error', 'error': job.get('error', 'Cancelled')}), 409
     if job['status']=='processing':
-        return jsonify({
+        resp = {
             'status': 'processing',
             'progress': job.get('progress', 0),
             'frame': job.get('frame', 0),
             'total_frames': job.get('total_frames', 0),
             'pass_info': job.get('pass_info'),
-        })
+        }
+        if job.get('video_profile'):
+            vp = job['video_profile']
+            resp['video_info'] = {
+                'duration_sec': vp.get('duration_sec'),
+                'resolution': f"{vp.get('width')}x{vp.get('height')}",
+                'quality': vp.get('quality_label'),
+                'calibration': vp.get('calibration', {}).get('source'),
+            }
+        return jsonify(resp)
     if job['status']=='error': return jsonify({'status':'error','error':job['error']}),500
     res = job['result']
     return jsonify({
@@ -2188,11 +3100,35 @@ def status(job_id):
         'summary': res,
     })
 
+def _safe_upload_path(filename: str) -> str | None:
+    name = os.path.basename(filename or '')
+    if not name or name in ('.', '..'):
+        return None
+    path = os.path.join(UPLOAD_FOLDER, name)
+    if not os.path.isfile(path):
+        return None
+    return path
+
+
 @app.route('/video/<filename>')
 def video(filename):
-    path = os.path.join(UPLOAD_FOLDER, filename)
-    if not os.path.exists(path): return jsonify({'error':'File not found'}),404
+    path = _safe_upload_path(filename)
+    if not path:
+        return jsonify({'error': 'File not found'}), 404
     return send_file(path, mimetype='video/mp4')
+
+
+@app.route('/download/<filename>')
+def download_video(filename):
+    path = _safe_upload_path(filename)
+    if not path:
+        return jsonify({'error': 'File not found'}), 404
+    return send_file(
+        path,
+        mimetype='video/mp4',
+        as_attachment=True,
+        download_name=os.path.basename(path),
+    )
 
 @app.route('/report/<job_id>.pdf')
 def download_report(job_id):
@@ -2245,6 +3181,28 @@ def health():
         'device': str(_yolo_device),
         'gpu_mode': 'cuda_required' if _GPU_CFG.get('require_cuda') else 'auto',
         'half_precision': _yolo_half,
+        'gemini': {
+            'enabled': bool(_GEMINI_CFG.get('enabled', False)),
+            'configured': get_gemini_umpire().configured,
+            'available': get_gemini_umpire().available,
+            'model': _GEMINI_CFG.get('model', 'gemini-2.0-flash'),
+            'mode': _GEMINI_CFG.get('mode', 'umpire'),
+            'architecture': 'pdf_hybrid',
+            'bounce_via': 'kinematic_engine',
+            'gemini_role': 'hit_verify_only',
+            'flight_corridor': bool(_PROC.get('flight_corridor', {}).get('enabled', True)),
+        },
+        'fully_automatic': FULLY_AUTOMATIC,
+        'features': {
+            'auto_pitch_calibration': True,
+            'auto_homography': True,
+            'player_detection': bool(_PROC.get('fully_automatic', {}).get('player_detection', True)),
+            'ball_track_release_to_end': True,
+            'multi_delivery': True,
+            'auto_recalibrate': bool(_PROC.get('fully_automatic', {}).get('auto_recalibrate', True)),
+            'annotated_video': True,
+            'pdf_report': True,
+        },
     })
 
 if __name__ == '__main__':

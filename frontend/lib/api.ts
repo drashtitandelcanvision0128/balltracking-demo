@@ -1,3 +1,17 @@
+export function getApiBase(): string {
+  if (process.env.NEXT_PUBLIC_API_URL) {
+    return process.env.NEXT_PUBLIC_API_URL.replace(/\/$/, '');
+  }
+  if (typeof window !== 'undefined') {
+    const { protocol, hostname } = window.location;
+    if (hostname && hostname !== 'localhost' && hostname !== '127.0.0.1') {
+      return `${protocol}//${hostname}:5000`;
+    }
+  }
+  return 'http://localhost:5000';
+}
+
+/** @deprecated prefer getApiBase() in browser code */
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:5000';
 
 export interface BounceEvent {
@@ -98,42 +112,47 @@ export async function uploadVideo(
   if (sessionId) params.set('session_id', sessionId);
   if (bowlerId) params.set('bowler_id', bowlerId);
   const qs = params.toString() ? `?${params}` : '';
-  const res = await fetch(`${API_BASE}/api/v1/videos/upload${qs}`, { method: 'POST', body: form });
+  const res = await fetch(`${getApiBase()}/api/v1/videos/upload${qs}`, { method: 'POST', body: form });
   return res.json();
 }
 
 export async function getJobStatus(jobId: string) {
-  const res = await fetch(`${API_BASE}/api/v1/jobs/${jobId}`);
+  const res = await fetch(`${getApiBase()}/api/v1/jobs/${jobId}`);
   return res.json();
 }
 
 export async function getAnalytics(sessionId?: string) {
   const qs = sessionId ? `?session_id=${sessionId}` : '';
-  const res = await fetch(`${API_BASE}/api/v1/analytics${qs}`);
+  const res = await fetch(`${getApiBase()}/api/v1/analytics${qs}`);
   return res.json() as Promise<Analytics>;
 }
 
 export async function getPitchmapData(sessionId?: string) {
   const qs = sessionId ? `?session_id=${sessionId}` : '';
-  const res = await fetch(`${API_BASE}/api/v1/pitchmap/data${qs}`);
+  const res = await fetch(`${getApiBase()}/api/v1/pitchmap/data${qs}`);
   return res.json();
 }
 
 export async function getHeatmaps(sessionId?: string, zoneFilter = 'all') {
   const params = new URLSearchParams({ zone_filter: zoneFilter });
   if (sessionId) params.set('session_id', sessionId);
-  const res = await fetch(`${API_BASE}/api/v1/heatmaps?${params}`);
+  const res = await fetch(`${getApiBase()}/api/v1/heatmaps?${params}`);
   return res.json();
 }
 
 export function buildVideoUrl(path: string) {
   if (path.startsWith('http')) return path;
-  return `${API_BASE}${path}`;
+  return `${getApiBase()}${path}`;
+}
+
+export function buildDownloadUrl(videoUrl: string) {
+  if (!videoUrl) return '';
+  return videoUrl.replace(/\/video\//, '/download/');
 }
 
 export function buildReportPdfUrl(path: string) {
   if (path.startsWith('http')) return path;
-  return `${API_BASE}${path}`;
+  return `${getApiBase()}${path}`;
 }
 
 /** @deprecated use buildVideoUrl */
